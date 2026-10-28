@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "agy-pool": {
+        "type": "local",
+        "command": ["python", "agy_pool.py"],
+        "environment": {
+          "AGY_CLIENT_ID": "{env:AGY_CLIENT_ID}",
+          "AGY_CLIENT_SECRET": "{env:AGY_CLIENT_SECRET}"
+        }
+      }
+    }
+  }
+}

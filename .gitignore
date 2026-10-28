@@ -1,0 +1,11 @@
+# State / local files never commit
+oauth.json
+*.enc
+accounts/
+*.token
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
