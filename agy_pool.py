@@ -82,6 +82,7 @@ def _load_oauth_credentials() -> Tuple[str, str]:
         return cid, secret
 
     for candidate in (
+        Path(r"E:\linhtinh\muse-discord-bot\BotMusicaDiscord\.env"),
         Path.home() / "muse-discord-bot" / "BotMusicaDiscord" / ".env",
     ):
         if not candidate.exists():
@@ -122,14 +123,15 @@ MODEL_ALIASES = {
     "pro": "gemini-3.8-flash-high",   # hardest reasoning, slowest (~8-10s)
     "high": "gemini-3.8-flash-high",
     "deep": "gemini-3.8-flash-high",
-    "default": "gemini-3-flash",      # best speed/quality balance (~2.5s)
-    "flash": "gemini-3-flash",
-    "fast": "gemini-3-flash",
+    "default": "gemini-3.8-flash-high",  # strongest reasoning (~9.5s, user choice)
+    "flash": "gemini-3.8-flash-high",
+    "fast": "gemini-3.8-flash-high",
+    "gemini": "gemini-3.8-flash-high",
     "lite": "gemini-3.5-flash-lite",  # cheapest, still passed all tests (~2.4s)
     "cheap": "gemini-3.5-flash-lite",
-    "sonnet": "claude-sonnet-4-6",    # strongest non-Google (~5s)
-    "claude": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6-thinking",
+    # sonnet/claude aliases removed on purpose (2026-10-28): Claude models draw
+    # from the scarce 3p-5h quota bucket (separate from gemini-5h), so ensembles
+    # should stay all-Gemini. The raw model name still works if ever needed.
     "gpt": "gpt-oss-120b-medium",     # NOT recommended: leaked reasoning, 439 out tokens
 }
 
@@ -758,7 +760,7 @@ async def agy_pool_chat(
 
     Args:
         prompt: The question or instruction.
-        model: Model name or alias (pro, flash, lite, sonnet, opus, gpt).
+        model: Model name or alias (pro, flash, lite, gpt).
         system: Optional system instruction.
         temperature: Sampling temperature.
         max_tokens: Maximum output tokens.
@@ -900,6 +902,92 @@ async def agy_pool_batch(
         "failed": len(results) - ok,
         "results": results,
     })
+
+
+@app.tool()
+async def agy_pool_fanout(
+    plan: List[Dict[str, Any]],
+    strategy: str = "all",
+    max_parallel: int = 6,
+) -> str:
+    """Fan a work order OUT to several Gemini agents in parallel, then collect all results.
+
+    This is the "agent as boss" pattern: you split a problem into independent
+    subtasks (the plan), fire them at multiple accounts/models at once, and get
+    every answer back in one call. Use it when thinking time is the bottleneck -
+    N parallel agents cost N quota but finish in roughly the time of one.
+
+    The subtasks MUST be independent: they run concurrently and see nothing of
+    each other. Merge/verify their outputs yourself (or with agy_pool_review)
+    after this returns - that is the "fan-in" step, and it is your job.
+
+    Args:
+        plan: List of subtasks, one per agent:
+            [{"task": "what this agent must produce",
+              "context": "optional extra context for this subtask",
+              "model": "optional alias override, e.g. 'lite'"}]
+            Keep 2-4 subtasks. Each agent only sees its own entry.
+        strategy: How to treat the results:
+            "all"  - return every response verbatim (default).
+            "vote" - responses are short factual answers; returns the majority
+                     answer and the vote distribution.
+        max_parallel: Concurrency cap (1-8).
+    """
+    if not plan:
+        return _err("plan must not be empty.")
+    if len(plan) > 8:
+        return _err("plan too large (max 8 agents). Keep subtasks meaningful.")
+
+    parallel = max(1, min(int(max_parallel or 6), 8))
+    sem = asyncio.Semaphore(parallel)
+
+    async def one(idx: int, item: Dict[str, Any]) -> Dict[str, Any]:
+        async with sem:
+            task = str(item.get("task") or "").strip()
+            if not task:
+                return {"index": idx, "status": "ERROR", "error": "empty task"}
+            context = str(item.get("context") or "").strip()
+            model = str(item.get("model") or "default").strip()
+            prompt = task if not context else f"{task}\n\nContext:\n{context}"
+            r = await _chat_once(prompt, model, temperature=0.2, max_tokens=16384)
+            r["index"] = idx
+            r["requested_model"] = model
+            return r
+
+    started = time.time()
+    results = await asyncio.gather(*(one(i, it) for i, it in enumerate(plan)))
+    wall_ms = int((time.time() - started) * 1000)
+
+    oks = [r for r in results if r.get("status") == "OK"]
+    payload: Dict[str, Any] = {
+        "status": "OK" if oks else "FAILED",
+        "agents": len(plan),
+        "succeeded": len(oks),
+        "failed": len(results) - len(oks),
+        "wall_ms": wall_ms,
+        "note": ("Subtasks ran in parallel on separate accounts. Merge and verify"
+                 " the outputs yourself before acting on them."),
+        "results": results,
+    }
+
+    if strategy == "vote":
+        votes: Dict[str, int] = {}
+        for r in oks:
+            key = (r.get("text") or "").strip()
+            votes[key] = votes.get(key, 0) + 1
+        if votes:
+            winner, count = max(votes.items(), key=lambda kv: kv[1])
+            payload["vote"] = {
+                "winner": winner[:2000],
+                "count": count,
+                "of": len(oks),
+                "distribution": {k[:120]: v for k, v in votes.items()},
+                "unanimous": len(votes) == 1,
+            }
+        else:
+            payload["vote"] = {"winner": None, "count": 0, "of": 0}
+
+    return _ok(payload)
 
 
 @app.tool()
