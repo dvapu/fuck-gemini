@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Gemini pool panel",
+    "description": "Shows live Gemini pool activity from the local MCP server.",
+    "detail": "docs/DETAIL.md"
+  }
+}

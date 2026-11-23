@@ -7,7 +7,8 @@
         "command": ["python", "agy_pool.py"],
         "environment": {
           "AGY_CLIENT_ID": "{env:AGY_CLIENT_ID}",
-          "AGY_CLIENT_SECRET": "{env:AGY_CLIENT_SECRET}"
+          "AGY_CLIENT_SECRET": "{env:AGY_CLIENT_SECRET}",
+          "AGY_POOL_DASHBOARD_PORT": "8791"
         }
       }
     }

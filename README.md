@@ -11,7 +11,7 @@ tokens and call the Gemini backend directly.**
 
 ### What this is
 
-A single-file MCP server (`agy_pool.py`, ~35 KB, no dependencies beyond
+A single-file MCP server (`agy_pool.py`, ~150 KB, no dependencies beyond
 `mcp >= 2.0`) that turns a pool of Google accounts into a rotation-capable
 Gemini API endpoint:
 
@@ -28,6 +28,53 @@ Gemini API endpoint:
 - **Parallel fan-out.** `agy_pool_fanout` fires independent subtasks at several
   accounts at once and collects every answer in one call (measured: 6 requests
   in 4.7 s wall time vs ~24 s sequential — a 5x speedup for independent work).
+
+### What changed in this version
+
+The file here now matches the full v2.2.0 build (an older, smaller build lived
+here before). Everything below is covered by the suite in `tests/`.
+
+- **Traffic shaping for account safety.** Per-account spacing with jitter
+  (`AGY_POOL_MIN_INTERVAL_SEC`, 4 s + 0-2 s), a rolling 60 s budget
+  (`AGY_POOL_ACCOUNT_RPM`, 15), a process-wide in-flight ceiling
+  (`AGY_POOL_MAX_INFLIGHT`, 2), and one request in flight per account. Health
+  probes pass through the same gate.
+- **Retry-After and escalating 429 cooldowns.** The upstream's own backoff is
+  honoured (capped at 1 h); repeated 429s double the cooldown (300 → 600 →
+  1200 ... capped at 1 h, plus jitter) and any success resets it.
+- **Pacing survives restarts.** `last_call`, cooldowns and strike counters are
+  persisted in the state file.
+- **`paths=` on `code_task` / `review`.** The server reads local files itself,
+  so a 300 KB source file never ships through tool-call JSON — which is where
+  "input too long" JSON errors came from. Unreadable inputs (binary,
+  oversized, unknown suffix, missing) are skipped and reported, not fatal.
+- **Continuation on `MAX_TOKENS`.** `chat` / `url` ask the model to continue
+  instead of returning half an answer: 3 rounds maximum, bounded at 3x the
+  requested output budget, and a failed round keeps what was already written.
+- **`map_reduce` tool.** Splits one oversized input on paragraph → line → word
+  boundaries (nothing is lost), one call per chunk, then one reduce call.
+- **Live activity dashboard** when `AGY_POOL_DASHBOARD_PORT` is set: serves
+  `http://127.0.0.1:<port>/activity` and writes `activity-<pid>.json` snapshots
+  that merge across processes. `python agy_pool.py --dashboard 8791` runs it
+  standalone.
+
+### Sidebar panel (DeepSeek Harness)
+
+`gemini-pool-panel/` is a DSH Web UI bundle that renders a strip in the composer
+dock: pool status and calls in flight, then (on click) every account with its
+cooldown and the last five calls with latency and status. It reads the dashboard
+endpoint, so the MCP server must run with `AGY_POOL_DASHBOARD_PORT=8791`. Install
+with **Plugins > Add plugin** and select the `gemini-pool-panel` directory. It
+shows `offline` when the server is not running, and it is read-only.
+
+### Tests
+
+```
+python tests/test_agy_pool_pacing.py   # pacing, in-flight cap, strikes, restore
+python tests/test_agy_pool_v2.py       # chunking, map_reduce, activity, dashboard
+python tests/test_agy_pool_v3.py       # paths=, skip semantics, continuation
+python tests/test_agy_pool_v4.py       # cross-process activity merge, CORS
+```
 
 ### Do I need agy-switch installed?
 
