@@ -2201,8 +2201,25 @@ async def _map_reduce(items: List[str], instruction: str, model: str,
         joined = "\n\n".join(trimmed)
 
     reduced = await _chat_once(f"{reduce_instruction}\n\n{joined}", model)
-    text = reduced.get("text") if reduced.get("status") == "OK" else joined
-    return {"status": "OK", "text": text, "parts": meta, "failed": failed}
+    if reduced.get("status") != "OK":
+        # A model-side 503 ends the pool's rotation on purpose. One pause and a
+        # second attempt is cheaper than handing back unreduced chunks silently.
+        await asyncio.sleep(1.5)
+        reduced = await _chat_once(f"{reduce_instruction}\n\n{joined}", model)
+    ok = reduced.get("status") == "OK"
+    out: Dict[str, Any] = {
+        "status": "OK" if ok else "PARTIAL",
+        "text": (reduced.get("text") if ok else "") or joined,
+        "parts": meta,
+        "failed": failed,
+        "reduce_status": reduced.get("status"),
+    }
+    if not ok:
+        # Never pretend joined chunks are a synthesis.
+        out["reduce_error"] = (reduced.get("error") or "")[:300]
+        out["hint"] = ("Every chunk answered, but the combine call failed; the "
+                       "text is the joined partials, not a synthesis.")
+    return out
 
 
 def _read_files_by_path(paths: List[str], max_total_chars: int = 500_000,
