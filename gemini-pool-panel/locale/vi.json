@@ -1,7 +1,0 @@
-{
-  "meta": {
-    "title": "Bảng Gemini pool",
-    "description": "Hiển thị hoạt động Gemini pool theo thời gian thực từ MCP server cục bộ.",
-    "detail": "docs/DETAIL.md"
-  }
-}

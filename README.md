@@ -53,27 +53,13 @@ here before). Everything below is covered by the suite in `tests/`.
   requested output budget, and a failed round keeps what was already written.
 - **`map_reduce` tool.** Splits one oversized input on paragraph → line → word
   boundaries (nothing is lost), one call per chunk, then one reduce call.
-- **Live activity dashboard** when `AGY_POOL_DASHBOARD_PORT` is set: serves
-  `http://127.0.0.1:<port>/activity` and writes `activity-<pid>.json` snapshots
-  that merge across processes. `python agy_pool.py --dashboard 8791` runs it
-  standalone.
-
-### Sidebar panel (DeepSeek Harness)
-
-`gemini-pool-panel/` is a DSH Web UI bundle that renders a strip in the composer
-dock: pool status and calls in flight, then (on click) every account with its
-cooldown and the last five calls with latency and status. It reads the dashboard
-endpoint, so the MCP server must run with `AGY_POOL_DASHBOARD_PORT=8791`. Install
-with **Plugins > Add plugin** and select the `gemini-pool-panel` directory. It
-shows `offline` when the server is not running, and it is read-only.
 
 ### Tests
 
 ```
 python tests/test_agy_pool_pacing.py   # pacing, in-flight cap, strikes, restore
-python tests/test_agy_pool_v2.py       # chunking, map_reduce, activity, dashboard
+python tests/test_agy_pool_v2.py       # chunking, JSON repair, map_reduce
 python tests/test_agy_pool_v3.py       # paths=, skip semantics, continuation
-python tests/test_agy_pool_v4.py       # cross-process activity merge, CORS
 ```
 
 ### Do I need agy-switch installed?

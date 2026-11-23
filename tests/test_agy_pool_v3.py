@@ -7,10 +7,7 @@ import tempfile
 from pathlib import Path
 
 os.environ["AGY_POOL_STATE"] = tempfile.mkdtemp(prefix="agy-v3-")
-_HERE = Path(__file__).resolve()
-for _cand in (_HERE.parent.parent, Path(r"C:\Users\b\.config\opencode\mcp")):
-    if (_cand / "agy_pool.py").exists():
-        sys.path.insert(0, str(_cand)); break
+sys.path.insert(0, r"C:\Users\b\.config\opencode\mcp")
 import agy_pool as m  # noqa: E402
 
 fails = []

@@ -19,10 +19,7 @@ os.environ["AGY_POOL_JITTER_SEC"] = "0"
 os.environ["AGY_POOL_MAX_INFLIGHT"] = "2"
 os.environ["AGY_POOL_ACCOUNT_RPM"] = "50"
 
-_HERE = Path(__file__).resolve()
-for _cand in (_HERE.parent.parent, Path(r"C:\Users\b\.config\opencode\mcp")):
-    if (_cand / "agy_pool.py").exists():
-        sys.path.insert(0, str(_cand)); break
+sys.path.insert(0, r"C:\Users\b\.config\opencode\mcp")
 import agy_pool as m  # noqa: E402
 
 fails = []

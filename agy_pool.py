@@ -38,10 +38,6 @@ Deployment knobs (environment)
     AGY_POOL_MAX_INFLIGHT Process-wide concurrent request ceiling, default 2.
                           fanout/batch still accept 8 items; they queue here.
 
-    AGY_POOL_DASHBOARD_PORT
-                          Serve http://127.0.0.1:<port>/activity and write
-                          activity-<pid>.json for other processes. Unset = off.
-                          The DSH sidebar panel reads that endpoint.
 
 Security
 --------
@@ -64,8 +60,6 @@ import os
 import random
 import re
 import ssl
-import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1331,11 +1325,8 @@ async def _agent_run(task: str, model: str, system: str, max_steps: int,
 
             payload = _build_payload(acc, model, contents, system, 0.2, max_tokens,
                                      False, None, None if forced else tools)
-            cid = ACTIVITY.begin(acc.email, acc.id, model)
             async with POOL.gate(acc):
-                ACTIVITY.step(cid, "sending")
                 body, code, detail = await asyncio.to_thread(_post, token, payload)
-            ACTIVITY.end(cid, code, detail)
             if body is None or code != 200:
                 trace.append({"step": step, "http": code,
                               "detail": _clip(detail, 300), "account": acc.email})
@@ -1480,13 +1471,9 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
         payload = _build_payload(acc, model, contents, system, temperature,
                                  max_tokens, json_mode, thinking_budget, tools)
         started = time.time()
-        cid = ACTIVITY.begin(acc.email, acc.id, model)
         async with POOL.gate(acc):
-            ACTIVITY.step(cid, "sending")
             body, code, detail, retry_after = await asyncio.to_thread(
                 _post_ex, token, payload, _attempt_timeout())
-        ACTIVITY.step(cid, "parsing")
-        ACTIVITY.end(cid, code, detail)
         elapsed = int((time.time() - started) * 1000)
 
         if body is not None and code == 200:
@@ -1528,10 +1515,8 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
                     payload = _build_payload(acc, model, contents, system, temperature,
                                              max_tokens, json_mode, thinking_budget, tools)
                     async with POOL.gate(acc):
-                        ACTIVITY.step(cid, "sending")
                         body, code, detail, retry_after = await asyncio.to_thread(
                             _post_ex, token, payload, _attempt_timeout())
-                    ACTIVITY.end(cid, code, detail)
                     elapsed = int((time.time() - started) * 1000)
                     if body is None or code != 200:
                         attempts.append({"account": acc.email, "http": code,
@@ -1736,371 +1721,6 @@ def _safe_json(text: str) -> Optional[Any]:
                     # failures worth repairing; anything else is a real miss.
                     return _repair_json(candidate)
     return None
-
-
-# --------------------------------------------------------------------------- #
-# Live activity (dashboard)
-# --------------------------------------------------------------------------- #
-
-class Activity:
-    """What the pool is doing right now, readable from a non-async thread.
-
-    The asyncio loop writes, the dashboard HTTP thread reads, so every mutation
-    and every snapshot goes through one lock. Nothing here is persisted: it is
-    a window on the running process, not history.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.started_at = time.time()
-        self._active: Dict[int, Dict[str, Any]] = {}
-        self._recent: List[Dict[str, Any]] = []
-        self._counts: Dict[str, int] = {}
-        self._ids: Dict[str, str] = {}
-        self._seq = 0
-        self._wrote_at = 0.0
-
-    def _touch(self, force: bool = False) -> None:
-        """Persist this process's view so another process can draw it.
-
-        DSH and OpenCode each run their own server; the sidebar panel must show
-        both. One small JSON per pid is cheaper and safer than a shared file.
-        Terminal events force a write: throttling them left calls looking
-        "in flight" forever.
-        """
-        now = time.time()
-        if not force and now - self._wrote_at < 0.5:
-            return
-        self._wrote_at = now
-        try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            target = STATE_DIR / f"activity-{os.getpid()}.json"
-            tmp = target.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.snapshot(), separators=(",", ":")),
-                           encoding="utf-8")
-            os.replace(tmp, target)
-        except Exception:
-            pass
-
-    def begin(self, email: str, account_id: str, model: str) -> int:
-        with self._lock:
-            self._seq += 1
-            cid = self._seq
-            self._ids[email] = account_id
-            self._active[cid] = {"id": f"{os.getpid()}-{cid}", "email": email,
-                                 "model": model, "step": "pacing",
-                                 "started_at": time.time()}
-            self._counts[email] = self._counts.get(email, 0) + 1
-        self._touch()
-        return cid
-
-    def step(self, cid: int, step: str) -> None:
-        with self._lock:
-            item = self._active.get(cid)
-            if item:
-                item["step"] = step
-        self._touch()
-
-    def end(self, cid: int, code: Optional[int], detail: str = "") -> None:
-        with self._lock:
-            item = self._active.pop(cid, None)
-            if not item:
-                return
-            elapsed_ms = int((time.time() - item["started_at"]) * 1000)
-            self._recent.append({
-                "at": time.time(), "email": item["email"], "model": item["model"],
-                "ms": elapsed_ms,
-                "status": "OK" if code == 200 else (str(code) if code else "ERR"),
-                "detail": (detail or "")[:120]})
-            del self._recent[:-40]
-        self._touch(force=True)
-
-    def snapshot(self) -> Dict[str, Any]:
-        now = time.time()
-        with self._lock:
-            active = [dict(v, elapsed_s=round(now - v["started_at"], 1))
-                      for v in self._active.values()]
-            recent = [dict(v) for v in self._recent[-20:]]
-            counts = dict(self._counts)
-            ids = dict(self._ids)
-            started = self.started_at
-        cooldowns = dict(POOL._cooldown)
-        accounts = []
-        for email, acc_id in ids.items():
-            mine = [a for a in active if a["email"] == email]
-            cool = cooldowns.get(acc_id, 0.0)
-            for key, until in cooldowns.items():
-                if key.startswith(acc_id + ":"):
-                    cool = max(cool, until)
-            left = round(max(0.0, cool - now), 1)
-            state = ("cooling" if left > 0 else
-                     "sending" if any(a["step"] == "sending" for a in mine) else
-                     "pacing" if mine else "idle")
-            accounts.append({"email": email, "state": state, "cooldown_s": left,
-                             "active": len(mine), "requests": counts.get(email, 0)})
-        accounts.sort(key=lambda a: a["email"])
-        return {"updated_at": now, "started_at": started,
-                "version": SERVER_VERSION,
-                "stats": dict(POOL._stats, inflight=len(active)),
-                "accounts": accounts, "active": active, "recent": recent}
-
-
-ACTIVITY = Activity()
-
-
-def _merge_snapshots(snapshots: List[Dict[str, Any]], now: float) -> Dict[str, Any]:
-    """One view over several server processes (DSH + OpenCode run their own)."""
-    active: List[Dict[str, Any]] = []
-    recent: List[Dict[str, Any]] = []
-    accounts: Dict[str, Dict[str, Any]] = {}
-    ok = fail = calls = 0
-    started = now
-    for snap in snapshots:
-        started = min(started, float(snap.get("started_at") or now))
-        active.extend(snap.get("active") or [])
-        recent.extend(snap.get("recent") or [])
-        stats = snap.get("stats") or {}
-        ok += int(stats.get("ok") or 0)
-        fail += int(stats.get("fail") or 0)
-        calls += int(stats.get("calls") or 0)
-        for item in snap.get("accounts") or []:
-            key = item.get("email") or "?"
-            held = accounts.get(key)
-            if held is None:
-                accounts[key] = dict(item)
-                continue
-            held["requests"] = int(held.get("requests") or 0) + int(item.get("requests") or 0)
-            held["active"] = int(held.get("active") or 0) + int(item.get("active") or 0)
-            if (item.get("cooldown_s") or 0) > (held.get("cooldown_s") or 0):
-                held["cooldown_s"] = item["cooldown_s"]
-                held["state"] = "cooling"
-    active.sort(key=lambda item: item.get("started_at") or 0)
-    recent.sort(key=lambda item: item.get("at") or 0)
-    return {"updated_at": now, "started_at": started,
-            "version": SERVER_VERSION,
-            "stats": {"ok": ok, "fail": fail, "calls": calls,
-                      "inflight": len(active)},
-            "accounts": sorted(accounts.values(),
-                               key=lambda item: item.get("email") or ""),
-            "active": active, "recent": recent[-20:],
-            "processes": len(snapshots)}
-
-
-def _pid_alive(pid: int) -> bool:
-    """True when the process still exists, without signalling it.
-
-    os.kill(pid, 0) is NOT usable here: on Windows any signal other than the
-    two console events terminates the target, which would kill the very server
-    whose activity we are reading.
-    """
-    if pid <= 0:
-        return False
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, pid)  # query limited
-            if not handle:
-                return False
-            try:
-                code = ctypes.c_ulong()
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return True
-                return code.value == 259  # STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(handle)
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    except Exception:
-        return True
-
-
-def _activity_snapshot() -> Dict[str, Any]:
-    """Local state plus every other pool process that wrote a snapshot lately."""
-    try:
-        local = ACTIVITY.snapshot()
-    except Exception as exc:  # a broken dashboard must never break a call
-        return {"error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()}
-    others: List[Dict[str, Any]] = []
-    now = time.time()
-    try:
-        for path in STATE_DIR.glob("activity-*.json"):
-            if path.name == f"activity-{os.getpid()}.json":
-                continue
-            try:
-                owner = int(path.stem.split("-", 1)[1])
-            except Exception:
-                owner = 0
-            if owner and not _pid_alive(owner):
-                try:
-                    path.unlink()
-                except Exception:
-                    pass
-                continue
-            try:
-                age = now - path.stat().st_mtime
-                if age > 600:
-                    # Left behind by a process that died: drop it instead of
-                    # showing a ghost call forever.
-                    try:
-                        path.unlink()
-                    except Exception:
-                        pass
-                    continue
-                if age > 180:
-                    continue
-                others.append(json.loads(path.read_text(encoding="utf-8")))
-            except Exception:
-                continue
-    except Exception:
-        others = []
-    if not others:
-        return local
-    return _merge_snapshots([local] + others, now)
-
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Gemini pool</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#c9d1d9;font:12px/1.45 ui-sans-serif,system-ui,Segoe UI,sans-serif;padding:12px}
-.bar{display:flex;justify-content:space-between;align-items:center;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 12px;margin-bottom:10px}
-b{color:#f0f6fc;font-size:13px}
-.mut{color:#8b949e}
-.pill{padding:2px 8px;border-radius:9px;font-size:11px;font-weight:600;text-transform:uppercase}
-.idle{background:#1f6feb22;color:#58a6ff}.busy{background:#d2992222;color:#d29922}.err{background:#f8514922;color:#f85149}
-h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#8b949e;margin:10px 0 6px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px}
-.mail{color:#f0f6fc;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.row{display:flex;justify-content:space-between;gap:8px}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
-.idle .dot{background:#3fb950}.sending .dot{background:#58a6ff}.pacing .dot{background:#d29922}.cooling .dot{background:#f85149}
-table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:6px}
-th,td{padding:5px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:11px;white-space:nowrap}
-th{color:#8b949e;font-weight:600}
-.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
-</style></head><body>
-<div class="bar"><b>Gemini pool <span class="mut" id="ver"></span></b>
-<span class="mut">in flight <b id="inflight">0</b></span><span id="pill" class="pill idle">idle</span>
-<span class="mut" id="up"></span></div>
-<h2>Accounts</h2><div class="grid" id="accounts"></div>
-<h2>Active calls</h2><table><thead><tr><th>model</th><th>account</th><th>step</th><th>elapsed</th></tr></thead><tbody id="active"></tbody></table>
-<h2>Recent</h2><table><thead><tr><th>time</th><th>model</th><th>account</th><th>ms</th><th>status</th></tr></thead><tbody id="recent"></tbody></table>
-<script>
-const $ = id => document.getElementById(id);
-const row = (cells, cls) => { const tr = document.createElement('tr');
-  cells.forEach(c => { const td = document.createElement('td'); if (c && c.cls) td.className = c.cls;
-    td.textContent = c && c.t !== undefined ? c.t : (c || ''); tr.appendChild(td); });
-  return tr; };
-function render(d) {
-  $('ver').textContent = 'v' + d.version; $('inflight').textContent = (d.stats && d.stats.inflight) || 0;
-  const n = (d.stats && d.stats.inflight) || 0;
-  $('pill').textContent = n ? 'busy' : 'idle'; $('pill').className = 'pill ' + (n ? 'busy' : 'idle');
-  const up = Math.max(0, d.updated_at - d.started_at);
-  $('up').textContent = 'up ' + Math.floor(up / 60) + 'm ' + Math.floor(up % 60) + 's';
-  const ag = $('accounts'); ag.replaceChildren();
-  (d.accounts || []).forEach(a => {
-    const c = document.createElement('div'); c.className = 'card ' + (a.state || 'idle');
-    const h = document.createElement('div'); h.className = 'row';
-    const m = document.createElement('span'); m.className = 'mail'; m.textContent = a.email;
-    const s = document.createElement('span'); s.className = 'mut';
-    s.textContent = a.state + (a.cooldown_s > 0 ? ' ' + Math.ceil(a.cooldown_s) + 's' : '');
-    h.append(m, s);
-    const b = document.createElement('div'); b.className = 'row mut';
-    const d1 = document.createElement('span'); d1.textContent = a.requests + ' calls';
-    const d2 = document.createElement('span'); d2.textContent = a.active ? a.active + ' live' : '';
-    b.append(d1, d2);
-    const dot = document.createElement('span'); dot.className = 'dot'; s.prepend(dot);
-    c.append(h, b); ag.appendChild(c); });
-  const ab = $('active'); ab.replaceChildren();
-  if (!(d.active || []).length) ab.appendChild(row([{ t: 'no calls in flight', cls: 'mut' }]));
-  (d.active || []).forEach(a => ab.appendChild(row([a.model, a.email, a.step, a.elapsed_s + 's'])));
-  const rb = $('recent'); rb.replaceChildren();
-  (d.recent || []).slice().reverse().forEach(r => {
-    const t = new Date(r.at * 1000).toLocaleTimeString();
-    const cls = r.status === 'OK' ? 'ok' : (r.status === '429' ? 'warn' : 'bad');
-    rb.appendChild(row([t, r.model, r.email, r.ms, { t: r.status, cls }])); });
-}
-async function tick() {
-  try {
-    const r = await fetch('/activity', { cache: 'no-store' });
-    if (!r.ok) { $('pill').textContent = 'error'; $('pill').className = 'pill err'; return; }
-    render(await r.json());
-  } catch (e) { $('pill').textContent = 'offline'; $('pill').className = 'pill err'; }
-}
-tick(); setInterval(tick, 1000);
-</script></body></html>"""
-
-_DASHBOARD_SERVER: Optional[Any] = None
-_DASHBOARD_LOCK = threading.Lock()
-
-
-def _start_dashboard(port: int) -> bool:
-    """Serve the activity page on 127.0.0.1, once per process."""
-    global _DASHBOARD_SERVER
-    with _DASHBOARD_LOCK:
-        if _DASHBOARD_SERVER is not None:
-            return True
-        try:
-            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-            class Handler(BaseHTTPRequestHandler):
-                def log_message(self, *args: Any) -> None:  # keep stdio clean
-                    return
-
-                def _cors(self) -> None:
-                    # The DSH page lives on another port, so the panel's fetch
-                    # is cross-origin. Read-only data, loopback only.
-                    self.send_header("Access-Control-Allow-Origin", "*")
-
-                def do_OPTIONS(self) -> None:
-                    self.send_response(204)
-                    self._cors()
-                    self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-                    self.send_header("Access-Control-Allow-Headers", "Content-Type")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-
-                def do_GET(self) -> None:
-                    try:
-                        if self.path in ("/", "/index.html"):
-                            body = DASHBOARD_HTML.encode("utf-8")
-                            ctype = "text/html; charset=utf-8"
-                        elif self.path.startswith("/activity"):
-                            body = json.dumps(_activity_snapshot()).encode("utf-8")
-                            ctype = "application/json"
-                        elif self.path == "/healthz":
-                            body, ctype = b"ok", "text/plain"
-                        else:
-                            self.send_response(404)
-                            self._cors()
-                            self.send_header("Content-Length", "0")
-                            self.end_headers()
-                            return
-                        self.send_response(200)
-                        self.send_header("Content-Type", ctype)
-                        self.send_header("Cache-Control", "no-store")
-                        self._cors()
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
-                    except (BrokenPipeError, ConnectionResetError):
-                        return
-
-            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-        except OSError as exc:
-            sys.stderr.write(f"agy-pool: dashboard bind failed on 127.0.0.1:{port}: {exc}\n")
-            return False
-        _DASHBOARD_SERVER = server
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        sys.stderr.write(f"agy-pool: dashboard http://127.0.0.1:{port}/\n")
-        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -2503,13 +2123,10 @@ async def health(
                 # be reported as a dead model. Disable thinking for the probe.
                 thinking_budget=0)
             started = time.time()
-            cid = ACTIVITY.begin(acc.email, acc.id, model_name)
             async with POOL.gate(acc):
-                ACTIVITY.step(cid, "sending")
                 body, code, detail, retry_after = await asyncio.to_thread(
                     _post_ex, token, payload,
                     int(max(15, min(90, deadline - time.time()))))
-            ACTIVITY.end(cid, code, detail)
             elapsed = int((time.time() - started) * 1000)
             if body is None or code != 200:
                 state = "COOLING" if code == 429 else (
@@ -3534,24 +3151,6 @@ async def map_reduce(
 
 
 def main() -> None:
-    argv = [arg for arg in sys.argv[1:] if arg]
-    if argv and argv[0] in ("--dashboard", "dashboard"):
-        # Standalone viewer: reads the snapshots every pool process writes, so
-        # it can run next to DSH/OpenCode instead of inside them.
-        port = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 8791
-        if not _start_dashboard(port):
-            raise SystemExit(1)
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            return
-    port = os.environ.get("AGY_POOL_DASHBOARD_PORT", "").strip()
-    if port:
-        try:
-            _start_dashboard(int(port))
-        except ValueError:
-            sys.stderr.write("agy-pool: AGY_POOL_DASHBOARD_PORT must be a number\n")
     app.run(transport="stdio")
 
 
