@@ -22,8 +22,10 @@ sends the next work order. The pool never touches files on its own.
 Deployment knobs (environment)
 ------------------------------
     AGY_POOL_TOOL_PREFIX  Tool-name prefix, default "agy_pool_". Set it to an
-                          empty value when the client already namespaces tools by
-                          server, so names do not collide or repeat themselves.
+                           empty value for DSH's short mcp__gemini__<tool> names.
+    AGY_POOL_DSH_SAFE     Compact ASCII-only results for DeepSeek Harness PTC.
+                          
+                          
     AGY_POOL_STATE        Directory for cooldown/session state, default
                           %LOCALAPPDATA%/agy-pool.
     AGY_CLIENT_ID, AGY_CLIENT_SECRET
@@ -35,8 +37,8 @@ Deployment knobs (environment)
                           default 4. Jitter of 0-2 s is added on top.
     AGY_POOL_JITTER_SEC   Upper bound of that random extra delay, default 2.
     AGY_POOL_ACCOUNT_RPM  Rolling-60s request budget per account, default 15.
-    AGY_POOL_MAX_INFLIGHT Process-wide concurrent request ceiling, default 2.
-                          fanout/batch still accept 8 items; they queue here.
+    AGY_POOL_MAX_INFLIGHT Initial process-wide gate capacity, default 2.
+                          The gate grows to the number of ready accounts.
 
 
 Security
@@ -61,15 +63,18 @@ import os
 import random
 import re
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.context import Context
 from pydantic import Field
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +206,7 @@ KNOWN_DEAD = {
     "gemini-3.5-flash-extra-low",  # same
 }
 
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "3.1.0"
 # Module load time. A patched file only runs after the client restarts the server, so
 # every status reply says whether the file on disk is newer than this process.
 _STARTED_AT = time.time()
@@ -229,6 +234,7 @@ def _code_stamp() -> Dict[str, Any]:
 # mcp__agy-pool__<tool>) should set this to an empty value: repeating the server
 # name inside every tool name costs tokens and reads badly.
 TOOL_PREFIX = os.environ.get("AGY_POOL_TOOL_PREFIX", "agy_pool_").strip()
+DSH_SAFE = os.environ.get("AGY_POOL_DSH_SAFE", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _t(suffix: str) -> str:
@@ -313,9 +319,19 @@ def _save_state(state: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _quota_buckets(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Remaining quota fractions keyed by bucket id (gemini-5h, 3p-5h, ...)."""
+    quota = raw.get("quota") or {}
+    buckets: Dict[str, Any] = {}
+    for group in quota.get("quota_groups") or []:
+        for bucket in group.get("buckets") or []:
+            buckets[bucket.get("bucket_id")] = bucket.get("remaining_fraction")
+    return buckets
+
+
 class Account:
     __slots__ = ("id", "email", "path", "access", "refresh", "expiry", "project",
-                 "disabled", "blocked", "tier", "last_error")
+                 "disabled", "blocked", "tier", "last_error", "quota_buckets")
 
     def __init__(self, raw: Dict[str, Any], path: Path):
         tok = raw.get("token") or {}
@@ -331,6 +347,7 @@ class Account:
         self.last_error = ""
         q = raw.get("quota") or {}
         self.tier = q.get("subscription_tier") or ""
+        self.quota_buckets = _quota_buckets(raw)
 
     @property
     def usable(self) -> bool:
@@ -479,6 +496,469 @@ async def _ensure_token(acc: Account) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
+# V3 Enhancement Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _quota_bucket(model: str) -> str:
+    """Return quota bucket family: 'gemini' or '3p'."""
+    m = (model or "").lower()
+    if any(k in m for k in ("claude", "gpt", "sonnet", "3p", "oss")):
+        return "3p"
+    return "gemini"
+
+
+def _get_account_quota_fraction(acc: Account, model: str) -> Optional[float]:
+    """Return the remaining quota fraction (0.0 to 1.0) for the model's bucket family."""
+    bucket = _quota_bucket(model)
+    qb = getattr(acc, "quota_buckets", None)
+    if not isinstance(qb, dict) or not qb:
+        return None
+    prefix = "3p" if bucket == "3p" else "gemini"
+    matching = [float(v) for k, v in qb.items()
+                if isinstance(k, str) and k.startswith(prefix) and isinstance(v, (int, float))]
+    if matching:
+        return min(matching)
+    key = "3p-5h" if bucket == "3p" else "gemini-5h"
+    val = qb.get(key)
+    if isinstance(val, (int, float)):
+        return float(val)
+    return None
+
+
+SYNTHETIC_CODE_TOOL = {
+    "functionDeclarations": [
+        {
+            "name": "apply_code_edits",
+            "description": "Apply structured code edits (create, replace, or patch files).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "analysis": {
+                        "type": "STRING",
+                        "description": "Short reasoning about what must change."
+                    },
+                    "changes": {
+                        "type": "ARRAY",
+                        "description": "List of file changes to apply.",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "path": {
+                                    "type": "STRING",
+                                    "description": "Absolute or repo-relative path."
+                                },
+                                "operation": {
+                                    "type": "STRING",
+                                    "enum": ["create", "replace", "patch"],
+                                    "description": "Edit operation to perform."
+                                },
+                                "content": {
+                                    "type": "STRING",
+                                    "description": "Full new file content (for create/replace)."
+                                },
+                                "search": {
+                                    "type": "STRING",
+                                    "description": "Exact existing text to replace (for patch)."
+                                },
+                                "replace": {
+                                    "type": "STRING",
+                                    "description": "New text (for patch)."
+                                }
+                            },
+                            "required": ["path", "operation"]
+                        }
+                    },
+                    "verification": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                        "description": "Commands or checks the orchestrator should run."
+                    },
+                    "risks": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                        "description": "Anything uncertain or incomplete."
+                    },
+                    "done": {
+                        "type": "BOOLEAN",
+                        "description": "Whether the work order is fully completed."
+                    }
+                },
+                "required": ["analysis", "changes", "done"]
+            }
+        }
+    ]
+}
+
+
+def sanitize_schema_for_gemini(
+    schema: Any,
+    root_schema: Optional[Dict[str, Any]] = None,
+    _visited_refs: Optional[set] = None,
+    _depth: int = 0
+) -> Any:
+    """Recursively sanitize JSON schema for Google Cloud Code PA Protobuf backend.
+
+    1. Resolves and inlines $ref pointers from $defs or definitions with circular reference protection.
+    2. Simplifies anyOf/oneOf (e.g. Optional[T] -> T with nullable=True, const variants -> enum).
+    3. Converts const: "val" to enum: ["val"].
+    4. Normalizes type names to uppercase (STRING, INTEGER, NUMBER, BOOLEAN, ARRAY, OBJECT).
+    5. Strips unsupported OpenAPI/Draft 7 keywords ($schema, $defs, definitions, title,
+       default, additionalProperties, patternProperties, propertyNames, minProperties, etc.).
+    6. Ensures ARRAY types have items defined.
+    """
+    if root_schema is None and isinstance(schema, dict):
+        root_schema = schema
+
+    if not isinstance(schema, dict):
+        return schema
+
+    if _depth > 25:
+        return {"type": "OBJECT"}
+
+    if _visited_refs is None:
+        _visited_refs = set()
+
+    # 1. Resolve $ref
+    if "$ref" in schema and root_schema:
+        ref_path = str(schema["$ref"])
+        if ref_path in _visited_refs:
+            return {"type": "OBJECT"}
+        _visited_refs.add(ref_path)
+        parts = ref_path.lstrip("#/").split("/")
+        target = root_schema
+        for part in parts:
+            if isinstance(target, dict) and part in target:
+                target = target[part]
+            else:
+                target = None
+                break
+        if isinstance(target, dict):
+            merged = dict(target)
+            for k, v in schema.items():
+                if k != "$ref":
+                    merged[k] = v
+            return sanitize_schema_for_gemini(merged, root_schema, _visited_refs, _depth + 1)
+
+    # 2. Resolve anyOf / oneOf (Common for Optional[T])
+    union_key = "anyOf" if "anyOf" in schema else ("oneOf" if "oneOf" in schema else None)
+    if union_key and isinstance(schema[union_key], list):
+        options = schema[union_key]
+        has_null = any(isinstance(opt, dict) and str(opt.get("type", "")).upper() == "NULL"
+                       for opt in options)
+        non_null_opts = [opt for opt in options
+                         if not (isinstance(opt, dict) and str(opt.get("type", "")).upper() == "NULL")]
+        if non_null_opts and all(isinstance(opt, dict) and "const" in opt for opt in non_null_opts):
+            base = {
+                "type": "STRING",
+                "enum": [str(opt["const"]) for opt in non_null_opts]
+            }
+            if has_null:
+                base["nullable"] = True
+            if "description" in schema:
+                base["description"] = schema["description"]
+            return sanitize_schema_for_gemini(base, root_schema, _visited_refs, _depth + 1)
+        if non_null_opts:
+            base = dict(non_null_opts[0])
+            if has_null:
+                base["nullable"] = True
+            if "description" in schema and "description" not in base:
+                base["description"] = schema["description"]
+            return sanitize_schema_for_gemini(base, root_schema, _visited_refs, _depth + 1)
+
+    # 3. Handle const -> enum
+    cleaned: Dict[str, Any] = {}
+    if "const" in schema and "enum" not in schema:
+        cleaned["enum"] = [str(schema["const"])]
+        if "type" not in schema:
+            cleaned["type"] = "STRING"
+
+    ALLOWED_KEYS = {
+        "type", "format", "description", "nullable",
+        "enum", "items", "properties", "required"
+    }
+    TYPE_MAP = {
+        "string": "STRING", "number": "NUMBER", "integer": "INTEGER",
+        "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT",
+    }
+
+    for k, v in schema.items():
+        if k in ("$ref", "$defs", "definitions", "$schema", "anyOf", "oneOf",
+                  "allOf", "title", "default"):
+            continue
+        if k not in ALLOWED_KEYS:
+            continue
+        if k == "type":
+            if isinstance(v, str):
+                cleaned["type"] = TYPE_MAP.get(v.lower(), v.upper())
+            else:
+                cleaned["type"] = v
+        elif k == "properties" and isinstance(v, dict):
+            cleaned["properties"] = {
+                prop_name: sanitize_schema_for_gemini(prop_schema, root_schema, set(_visited_refs), _depth + 1)
+                for prop_name, prop_schema in v.items()
+            }
+        elif k == "items":
+            cleaned["items"] = sanitize_schema_for_gemini(v, root_schema, set(_visited_refs), _depth + 1)
+        elif k == "required" and isinstance(v, list):
+            cleaned["required"] = [str(x) for x in v]
+        elif k == "enum" and isinstance(v, list):
+            cleaned["enum"] = [str(x) for x in v]
+        elif k == "nullable":
+            cleaned["nullable"] = bool(v)
+        elif k in ("description", "format"):
+            cleaned[k] = str(v)
+
+    if "type" not in cleaned:
+        if "items" in cleaned:
+            cleaned["type"] = "ARRAY"
+        elif "properties" in cleaned:
+            cleaned["type"] = "OBJECT"
+
+    if cleaned.get("type") == "ARRAY" and "items" not in cleaned:
+        cleaned["items"] = {"type": "STRING"}
+
+    return cleaned
+
+
+def parse_upstream_quota_reset(body_json: Any) -> Optional[float]:
+    """Parse exact reset_time or retryDelay from Google RPC error details or message."""
+    import datetime
+    if not isinstance(body_json, dict):
+        return None
+    error = body_json.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    details = error.get("details") or []
+
+    # 1. RetryInfo check (retryDelay can be string '120s' or Protobuf duration dict)
+    for d in details:
+        if isinstance(d, dict) and ("RetryInfo" in d.get("@type", "") or "retryDelay" in d):
+            rd = d.get("retryDelay")
+            if isinstance(rd, str):
+                m = re.match(r"^([\d.]+)\s*s?$", rd.strip())
+                if m:
+                    return float(m.group(1))
+            elif isinstance(rd, dict):
+                sec = rd.get("seconds")
+                nanos = rd.get("nanos") or 0
+                if sec is not None:
+                    return float(sec) + float(nanos) / 1e9
+            elif isinstance(rd, (int, float)):
+                return float(rd)
+
+    # 2. ErrorInfo metadata.reset_time check (ISO 8601 UTC)
+    for d in details:
+        if isinstance(d, dict) and ("ErrorInfo" in d.get("@type", "") or "metadata" in d):
+            meta = d.get("metadata") or {}
+            reset_str = meta.get("reset_time") or meta.get("resetTime")
+            if reset_str and isinstance(reset_str, str):
+                try:
+                    dt_str = reset_str.replace("Z", "+00:00")
+                    reset_dt = datetime.datetime.fromisoformat(dt_str)
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    delta_sec = (reset_dt - now_dt).total_seconds()
+                    if delta_sec > 0:
+                        return delta_sec + 2.0  # +2s safety margin
+                except Exception:
+                    pass
+
+    # 3. Fallback: Parse error message string
+    msg = str(error.get("message") or "")
+    m = re.search(r"(?:retry|try again)(?:\s+after|\s+in)?\s+([\d.]+)\s*s(?:ec|econds?)?", msg, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+
+    return None
+
+
+class EndpointFailoverManager:
+    """Thread-safe circuit breaker for the daily canary and production endpoint.
+
+    The HTTP request runs in ``asyncio.to_thread``, so every state transition is
+    protected by a real ``threading.Lock``.  Half-open recovery uses sequential
+    probes: one request may try daily at a time; other requests stay on prod
+    until three consecutive probes succeed.
+    """
+    DAILY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent"
+    PROD_URL = "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+    FAIL_THRESHOLD = 3
+    HALF_OPEN_SUCCESSES = 3
+    COOLDOWN_SECONDS = 300.0
+    TRANSIENT_STATUS = {500, 502, 503, 504, 529}
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = "CLOSED"
+        self._daily_fails = 0
+        self._daily_429 = 0
+        self._half_open_successes = 0
+        self._cooldown_until = 0.0
+        self._probe_in_flight = False
+
+    def _open_locked(self) -> None:
+        self._state = "OPEN"
+        self._cooldown_until = time.time() + self.COOLDOWN_SECONDS
+        self._probe_in_flight = False
+        self._half_open_successes = 0
+
+    def acquire_endpoint(self) -> str:
+        """Reserve an endpoint for one request without hiding side effects."""
+        with self._lock:
+            now = time.time()
+            if self._state == "OPEN" and now >= self._cooldown_until:
+                self._state = "HALF_OPEN"
+                self._probe_in_flight = False
+                self._half_open_successes = 0
+            if self._state == "HALF_OPEN":
+                if not self._probe_in_flight:
+                    self._probe_in_flight = True
+                    return self.DAILY_URL
+                return self.PROD_URL
+            if self._state == "OPEN":
+                return self.PROD_URL
+            return self.DAILY_URL
+
+    def note_failure(self, url: str, status_code: Optional[int]) -> None:
+        with self._lock:
+            if self.DAILY_URL not in url:
+                return
+            self._probe_in_flight = False
+            if self._state == "HALF_OPEN":
+                # Any failed canary means daily is still unhealthy.
+                self._open_locked()
+                return
+            if status_code in self.TRANSIENT_STATUS or status_code is None:
+                self._daily_fails += 1
+                if self._daily_fails >= self.FAIL_THRESHOLD:
+                    self._open_locked()
+                return
+            if status_code == 429:
+                # A single 429 is normally account-scoped.  Repeated 429s across
+                # account rotations, with no daily success between them, indicate
+                # an endpoint-wide throttle and justify a temporary prod route.
+                self._daily_429 += 1
+                if self._daily_429 >= self.FAIL_THRESHOLD:
+                    self._open_locked()
+
+    def note_success(self, url: str) -> None:
+        with self._lock:
+            if self.DAILY_URL not in url:
+                return
+            self._daily_429 = 0
+            if self._state == "HALF_OPEN":
+                self._probe_in_flight = False
+                self._half_open_successes += 1
+                if self._half_open_successes >= self.HALF_OPEN_SUCCESSES:
+                    self._state = "CLOSED"
+                    self._daily_fails = 0
+                    self._half_open_successes = 0
+                    self._cooldown_until = 0.0
+                return
+            if self._state == "CLOSED":
+                self._daily_fails = 0
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Read-only diagnostics; never reserves a probe or mutates state."""
+        with self._lock:
+            if self._state == "OPEN" and time.time() < self._cooldown_until:
+                endpoint = self.PROD_URL
+            else:
+                endpoint = self.DAILY_URL
+            return {
+                "active_endpoint": endpoint,
+                "state": self._state,
+                "daily_fails": self._daily_fails,
+                "daily_429": self._daily_429,
+                "half_open_successes": self._half_open_successes,
+                "probe_in_flight": self._probe_in_flight,
+                "cooldown_remaining": max(0, int(self._cooldown_until - time.time())),
+            }
+
+
+class DynamicGate:
+    """Dynamic async gate built from public asyncio primitives only.
+
+    Capacity may shrink below the number of active holders.  Those holders drain
+    naturally; no waiter is woken until ``active < capacity``.  Cancelled waiters
+    are removed without leaking a permit.
+    """
+    def __init__(self, initial_capacity: int = 2, max_capacity: int = 32):
+        self._capacity = max(1, int(initial_capacity))
+        self._max_capacity = max(1, int(max_capacity))
+        self._active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def active_in_flight(self) -> int:
+        return self._active
+
+    def resize(self, new_capacity: int) -> None:
+        target = max(1, min(self._max_capacity, int(new_capacity)))
+        if target == self._capacity:
+            return
+        added = max(0, target - self._capacity)
+        self._capacity = target
+        while added > 0 and self._waiters:
+            waiter = self._waiters.popleft()
+            if waiter.done():
+                continue
+            self._active += 1
+            waiter.set_result(None)
+            added -= 1
+
+    async def acquire(self) -> None:
+        if self._active < self._capacity:
+            self._active += 1
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                # resize() already transferred a permit to this waiter.
+                self.release()
+            else:
+                try:
+                    self._waiters.remove(waiter)
+                except ValueError:
+                    pass
+            raise
+
+    def release(self) -> None:
+        if self._active <= 0:
+            return
+        self._active -= 1
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if waiter.done():
+                continue
+            if self._active < self._capacity:
+                self._active += 1
+                waiter.set_result(None)
+            else:
+                self._waiters.appendleft(waiter)
+            return
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+# Global endpoint failover manager (circuit breaker)
+_ENDPOINT_MANAGER = EndpointFailoverManager()
+
+
+# --------------------------------------------------------------------------- #
 # Rotation
 # --------------------------------------------------------------------------- #
 
@@ -488,7 +968,8 @@ class Pool:
         self._cursor = 0
         self._cooldown: Dict[str, float] = {}
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
-        self._stats: Dict[str, Any] = {"ok": 0, "fail": 0, "calls": 0}
+        self._stats: Dict[str, Any] = {"ok": 0, "fail": 0, "calls": 0,
+                                        "cached_tokens_total": 0}
         # keyed by account id: survives the fresh Account objects created by
         # every _load_accounts() call, so status() can report the last reason
         self._last_errors: Dict[str, str] = {}
@@ -499,8 +980,15 @@ class Pool:
         self._strikes: Dict[str, int] = {}
         self._acct_locks: Dict[str, asyncio.Lock] = {}
         self._gate_sem: Optional[asyncio.Semaphore] = None
+        # V3: Dynamic concurrency gate & per-account usage history for Waterfilling
+        self._dynamic_gate: Optional[DynamicGate] = DynamicGate(initial_capacity=MAX_INFLIGHT, max_capacity=32)
+        self._hourly_usage: Dict[str, List[float]] = {}
         self._state_saved_at = 0.0
         self._restore(_load_state())
+
+    def update_dynamic_concurrency(self, total_accounts: int) -> None:
+        if self._dynamic_gate is not None:
+            self._dynamic_gate.resize(total_accounts)
 
     def _restore(self, state: Dict[str, Any]) -> None:
         """Re-apply cooldowns from a previous process, dropping expired ones.
@@ -547,14 +1035,20 @@ class Pool:
         }
 
     @staticmethod
-    def _key(acc: Account, model: str) -> str:
-        """Cooldown is per (account, model).
+    def _key(acc: Any, model: str) -> str:
+        """Cooldown is per (account, quota-bucket-family).
 
-        A model that is dead or rate-limited must not take the account out of
-        service for every other model. The empty-model key is a whole-account
-        penalty, used only for auth failures where the credential itself is bad.
+        Google allocates quota per bucket: all gemini-* models share the
+        5-hour Gemini quota; claude/gpt/etc share the 3p quota. Penalising
+        per exact model string means a 429 on flash-high does not block
+        flash-lite (same bucket), and a Claude 429 does not kill Gemini
+        quota. The empty-model key is a whole-account penalty, used only
+        for auth failures where the credential itself is bad.
         """
-        return f"{acc.id}:{model}" if model else acc.id
+        acc_id = acc.id if hasattr(acc, "id") else str(acc)
+        if not model:
+            return acc_id
+        return f"{acc_id}:bucket:{_quota_bucket(model)}"
 
     def _cool_left(self, acc: Account, model: str) -> float:
         now = time.time()
@@ -562,18 +1056,67 @@ class Pool:
                    self._cooldown.get(self._key(acc, ""), 0)) - now
 
     def _pick_order(self, accounts: List[Account],
-                    model: str = "") -> List[Account]:
-        ready = [a for a in accounts
-                 if self._cool_left(a, model) <= 0]
-        cooling = [a for a in accounts
-                   if self._cool_left(a, model) > 0]
+                    model: str = "",
+                    preferred_acc_id: Optional[str] = None) -> List[Account]:
+        """Waterfilling quota router with sticky-session affinity.
+
+        1. Sticky session: if preferred_acc_id is ready, pin it first.
+        2. Waterfilling: prioritize accounts with highest % quota remaining.
+           Reserve accounts with < 5% quota (< 0.05) for emergency only.
+        3. Headroom scoring: among accounts with similar quota, prefer
+           accounts that are idle longest and have fewest recent requests/strikes.
+        4. Cooling accounts trail as a last resort.
+        """
+        now = time.time()
+
+        def is_ready(a: Account) -> bool:
+            return self._cool_left(a, model) <= 0
+
+        ready = [a for a in accounts if is_ready(a)]
+        cooling = [a for a in accounts if not is_ready(a)]
+
         if not ready:
-            # everything cooling: use the least-cooled anyway
+            # Everything cooling: use the least-cooled anyway
             return sorted(accounts, key=lambda a: self._cool_left(a, model))
-        start = self._cursor % len(ready)
-        rotated = ready[start:] + ready[:start]
-        self._cursor = (self._cursor + 1) % max(1, len(ready))
-        return rotated + cooling
+
+        # 1. Sticky Session Affinity
+        pinned: Optional[Account] = None
+        if preferred_acc_id:
+            for i, a in enumerate(ready):
+                if a.id == preferred_acc_id or a.email == preferred_acc_id:
+                    pinned = ready.pop(i)
+                    break
+
+        # 2. Waterfilling & Headroom Scoring
+        def calculate_score(a: Account) -> float:
+            usage = [t for t in self._hourly_usage.get(a.id, []) if now - t < 18000.0]
+            self._hourly_usage[a.id] = usage
+            strikes = self._strikes.get(self._key(a, model), 0)
+            idle_seconds = now - self._last_call.get(a.id, 0.0)
+            q_frac = _get_account_quota_fraction(a, model)
+            quota_score = (q_frac if q_frac is not None else 1.0) * 1000.0
+            headroom = (idle_seconds * 1.5) - (len(usage) * 20.0) - (strikes * 100.0)
+            return quota_score + headroom
+
+        # Separate accounts into normal (>= 5% quota) and emergency (< 5% quota)
+        normal_ready: List[Account] = []
+        emergency_ready: List[Account] = []
+
+        for a in ready:
+            q_frac = _get_account_quota_fraction(a, model)
+            if q_frac is not None and q_frac < 0.05:
+                emergency_ready.append(a)
+            else:
+                normal_ready.append(a)
+
+        normal_sorted = sorted(normal_ready, key=calculate_score, reverse=True)
+        emergency_sorted = sorted(emergency_ready, key=calculate_score, reverse=True)
+
+        ordered_ready = normal_sorted + emergency_sorted
+        if pinned:
+            ordered_ready.insert(0, pinned)
+
+        return ordered_ready + cooling
 
     def refresh_lock(self, acc: Account) -> asyncio.Lock:
         """Serialize token refresh per account.
@@ -608,9 +1151,13 @@ class Pool:
         account's turn happens BEFORE taking a global slot: doing it the other
         way let one rate-limited account hold every slot while it slept, which
         stalled the whole pool behind a single account.
+
+        V3: Uses DynamicGate instead of a fixed Semaphore, so the in-flight
+        ceiling grows as more accounts become available.
         """
-        if self._gate_sem is None:
-            self._gate_sem = asyncio.Semaphore(MAX_INFLIGHT)
+        if self._dynamic_gate is None:
+            self._dynamic_gate = DynamicGate(initial_capacity=MAX_INFLIGHT, max_capacity=32)
+        # Legacy gate_sem is kept for backward compat but DynamicGate takes over
         lock = self._acct_locks.get(acc.id)
         if lock is None:
             lock = asyncio.Lock()
@@ -638,17 +1185,23 @@ class Pool:
                 step = min(wait, 2.0)
                 await asyncio.sleep(step)
                 waited += step
-            async with self._gate_sem:
+            async with self._dynamic_gate:
                 stamp = time.time()
                 self._last_call[acc.id] = stamp
                 self._bucket.setdefault(acc.id, []).append(stamp)
+                # Track usage for Waterfilling headroom scoring
+                self._hourly_usage.setdefault(acc.id, []).append(stamp)
                 yield
 
-    def note_success(self, acc: Account, model: str = "") -> None:
+    def note_success(self, acc: Any, model: str = "") -> None:
         """A good answer relaxes the backoff again."""
+        acc_id = acc.id if hasattr(acc, "id") else str(acc)
         self._strikes.pop(self._key(acc, model), None)
-        self._strikes.pop(acc.id, None)
+        self._strikes.pop(f"{acc_id}:{model}", None)
+        self._strikes.pop(acc_id, None)
         self._cooldown.pop(self._key(acc, model), None)
+        self._cooldown.pop(f"{acc_id}:{model}", None)
+        self._cooldown.pop(acc_id, None)
 
     def strike_rate(self, acc: Account, model: str,
                     retry_after: Optional[float] = None) -> int:
@@ -661,9 +1214,10 @@ class Pool:
         key = self._key(acc, model)
         n = self._strikes.get(key, 0) + 1
         self._strikes[key] = n
-        seconds = float(COOLDOWN_RATE_LIMIT * (2 ** min(n - 1, 5)))
-        if retry_after:
-            seconds = max(seconds, float(retry_after))
+        if retry_after is not None and float(retry_after) > 0:
+            seconds = float(retry_after)
+        else:
+            seconds = float(COOLDOWN_RATE_LIMIT * (2 ** min(n - 1, 5)))
         seconds = int(min(seconds, float(STRIKE_CAP_SECONDS))
                       + random.uniform(0, 30))
         self._penalize(acc, seconds, model)
@@ -711,10 +1265,15 @@ def _build_payload(acc: Account, model: str, contents: List[Dict[str, Any]],
                    system: str, temperature: float, max_tokens: int,
                    json_mode: bool,
                    thinking_budget: Optional[int] = None,
-                   tools: Optional[List[Dict[str, Any]]] = None) -> bytes:
+                   tools: Optional[List[Dict[str, Any]]] = None,
+                   response_schema: Optional[Dict[str, Any]] = None,
+                   synthetic_code_tool: bool = False) -> bytes:
     gen: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_tokens}
-    if json_mode:
+    if json_mode and not synthetic_code_tool:
         gen["responseMimeType"] = "application/json"
+        # V3: Inject sanitized responseSchema for constrained decoding
+        if response_schema:
+            gen["responseSchema"] = sanitize_schema_for_gemini(response_schema)
     # Reasoning models happily burn the entire output budget on hidden thoughts
     # and then return an empty candidate with finishReason=MAX_TOKENS. Capping
     # the thinking budget is the only reliable way to get text back from a
@@ -723,8 +1282,17 @@ def _build_payload(acc: Account, model: str, contents: List[Dict[str, Any]],
         gen["thinkingConfig"] = {"thinkingBudget": int(thinking_budget)}
 
     request: Dict[str, Any] = {"contents": contents, "generationConfig": gen}
-    if tools:
-        request["tools"] = tools
+    final_tools = list(tools) if tools else []
+    if synthetic_code_tool:
+        final_tools.append(SYNTHETIC_CODE_TOOL)
+        request["toolConfig"] = {
+            "functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": ["apply_code_edits"]
+            }
+        }
+    if final_tools:
+        request["tools"] = final_tools
     if system:
         request["systemInstruction"] = {"parts": [{"text": system}]}
 
@@ -765,9 +1333,12 @@ def _post_ex(token: str, payload: bytes,
     retry_after is the upstream's own backoff request. Ignoring it and retrying
     on the fixed cooldown is exactly the behaviour that turns a soft throttle
     into an account review.
+
+    V3: Uses _ENDPOINT_MANAGER (circuit breaker) to select daily vs prod endpoint.
     """
+    endpoint = _ENDPOINT_MANAGER.acquire_endpoint()
     req = urllib.request.Request(
-        API_ENDPOINT,
+        endpoint,
         data=payload,
         method="POST",
         headers={
@@ -779,16 +1350,31 @@ def _post_ex(token: str, payload: bytes,
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace")), 200, "", None
+            body = json.loads(r.read().decode("utf-8", "replace"))
+            _ENDPOINT_MANAGER.note_success(endpoint)
+            return body, 200, "", None
     except urllib.error.HTTPError as e:
         try:
-            detail = e.read().decode("utf-8", "replace")[:400]
+            raw = e.read().decode("utf-8", "replace")
         except Exception:
-            detail = ""
+            raw = ""
+        detail = raw[:400]
         retry_after = _parse_retry_after(e.headers.get("Retry-After")
                                          if e.headers else None)
+        # V3: If no Retry-After header, try to parse from the response body
+        if retry_after is None and e.code == 429:
+            try:
+                body_json = json.loads(raw)
+                retry_after = parse_upstream_quota_reset(body_json)
+            except Exception:
+                pass
+        # V3: Notify circuit breaker of gateway failures on the daily endpoint
+        if e.code in (500, 502, 503, 504, 529):
+            _ENDPOINT_MANAGER.note_failure(endpoint, e.code)
         return None, e.code, detail, retry_after
     except Exception as exc:
+        # V3: Network-level failures count as a circuit breaker failure
+        _ENDPOINT_MANAGER.note_failure(endpoint, None)
         return None, None, f"{type(exc).__name__}: {exc}", None
 
 
@@ -799,10 +1385,21 @@ def _post(token: str, payload: bytes,
 
 
 def _extract_text(body: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Extract text, metadata and raw parts from an API response.
+
+    V3 enhancements:
+    - Skips thought parts when extracting text (doesn't include thoughtSignature text)
+    - Preserves raw_parts (including thoughtSignature) in meta["parts"]
+    - Extracts cachedContentTokenCount and cache_hit_ratio for telemetry
+    - Extracts functionCall args as synthetic JSON text if no text parts
+    """
     resp = body.get("response") if isinstance(body.get("response"), dict) else body
     candidates = resp.get("candidates") or []
     text = ""
     finish = ""
+    raw_parts: List[Dict[str, Any]] = []
+    function_call: Optional[Dict[str, Any]] = None
+
     # finishReason must be captured even when no text was produced. A thinking
     # model that burns its whole budget returns MAX_TOKENS with an empty part
     # list; if we only recorded `finish` alongside text, that case looked like a
@@ -811,12 +1408,35 @@ def _extract_text(body: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if not finish:
             finish = cand.get("finishReason") or ""
         parts = (cand.get("content") or {}).get("parts") or []
-        chunk = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        raw_parts = [dict(p) for p in parts if isinstance(p, dict)]
+
+        # Scan for functionCall in raw_parts
+        for p in raw_parts:
+            if "functionCall" in p and function_call is None:
+                function_call = p["functionCall"]
+
+        # 1. Text extraction: skip thought parts (preserve thoughtSignature in raw_parts)
+        chunk = "".join(p.get("text", "") for p in parts
+                        if isinstance(p, dict) and "text" in p and not p.get("thought"))
         if chunk.strip():
             text = chunk
             finish = cand.get("finishReason") or finish
             break
+
+        # 2. Synthetic Tool Calling extraction: functionCall.args -> JSON text
+        if function_call:
+            args = function_call.get("args") or {}
+            text = json.dumps(args, ensure_ascii=False)
+            finish = cand.get("finishReason") or finish or "STOP"
+            break
+        if text:
+            break
+
     usage = resp.get("usageMetadata") or body.get("usageMetadata") or {}
+    cached_tokens = usage.get("cachedContentTokenCount") or 0
+    prompt_tokens = usage.get("promptTokenCount") or 0
+    cache_hit_ratio = round(cached_tokens / prompt_tokens, 4) if prompt_tokens > 0 else 0.0
+
     grounding = None
     for cand in candidates:
         gm = cand.get("groundingMetadata")
@@ -833,13 +1453,20 @@ def _extract_text(body: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             "sources": sources,
         }
         break
+
     meta: Dict[str, Any] = {
         "finish_reason": finish,
         "tokens": usage.get("totalTokenCount"),
-        "prompt_tokens": usage.get("promptTokenCount"),
+        "prompt_tokens": prompt_tokens,
         "output_tokens": usage.get("candidatesTokenCount"),
         "thought_tokens": usage.get("thoughtsTokenCount"),
+        "cached_tokens": cached_tokens,
+        "cache_hit_ratio": cache_hit_ratio,
+        "parts": raw_parts,
     }
+    if function_call:
+        meta["function_call"] = function_call
+
     # A safety refusal produces an empty candidate, exactly like a burned
     # thinking budget. Telling them apart matters: retrying accounts cannot fix
     # a blocked prompt, and penalizing accounts for it hides the real cause.
@@ -1422,13 +2049,18 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
                      json_mode: bool = False,
                      history: Optional[List[Dict[str, Any]]] = None,
                      thinking_budget: Optional[int] = None,
-                     tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                     tools: Optional[List[Dict[str, Any]]] = None,
+                     preferred_account: Optional[str] = None,
+                     response_schema: Optional[Dict[str, Any]] = None,
+                     synthetic_code_tool: bool = False) -> Dict[str, Any]:
     """Run one prompt across the pool, rotating on failure.
 
     Rotation rules: only account-scoped failures (401/403, 429, timeouts, 5xx)
     move to the next account. Model-scoped answers -- retired model, burned
     thinking budget, safety block -- fail immediately with the real cause,
     because every account will answer identically and rotating only burns quota.
+
+    V3: preferred_account enables sticky session affinity (Prompt Cache locality).
     """
     accounts, err = _load_accounts()
     if err:
@@ -1448,7 +2080,11 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
             {"role": "user", "parts": [{"text": str(prompt_or_contents)}]}
         ]
 
-    order = POOL._pick_order(accounts, model)
+    # V3: Resize DynamicGate to match current pool size
+    if POOL._dynamic_gate is None:
+        POOL._dynamic_gate = DynamicGate(initial_capacity=MAX_INFLIGHT, max_capacity=32)
+    POOL._dynamic_gate.resize(len(accounts))
+    order = POOL._pick_order(accounts, model, preferred_acc_id=preferred_account)
     attempts: List[Dict[str, Any]] = []
     tried = 0
     bumped = False
@@ -1491,7 +2127,9 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
             continue
 
         payload = _build_payload(acc, model, contents, system, temperature,
-                                 max_tokens, json_mode, thinking_budget, tools)
+                                 max_tokens, json_mode, thinking_budget, tools,
+                                 response_schema=response_schema,
+                                 synthetic_code_tool=synthetic_code_tool)
         started = time.time()
         async with POOL.gate(acc):
             body, code, detail, retry_after = await asyncio.to_thread(
@@ -1535,7 +2173,9 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
                     })
                     max_tokens = new_max
                     payload = _build_payload(acc, model, contents, system, temperature,
-                                             max_tokens, json_mode, thinking_budget, tools)
+                                             max_tokens, json_mode, thinking_budget, tools,
+                                             response_schema=response_schema,
+                                             synthetic_code_tool=synthetic_code_tool)
                     async with POOL.gate(acc):
                         body, code, detail, retry_after = await asyncio.to_thread(
                             _post_ex, token, payload, _attempt_timeout())
@@ -1569,11 +2209,15 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
                     POOL.note_success(acc, model)
                     POOL._stats["ok"] += 1
                     POOL._stats["calls"] += 1
+                    POOL._stats["cached_tokens_total"] = (
+                        POOL._stats.get("cached_tokens_total") or 0
+                    ) + meta.get("cached_tokens", 0)
                     return {
                         "status": "OK",
                         "text": text,
                         "model": model,
                         "account": acc.email,
+                        "account_id": acc.id,
                         "latency_ms": elapsed,
                         **meta,
                         "note": f"max_tokens auto-raised to {max_tokens}",
@@ -1601,11 +2245,15 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
             POOL.note_success(acc, model)
             POOL._stats["ok"] += 1
             POOL._stats["calls"] += 1
+            POOL._stats["cached_tokens_total"] = (
+                POOL._stats.get("cached_tokens_total") or 0
+            ) + meta.get("cached_tokens", 0)
             return {
                 "status": "OK",
                 "text": text,
                 "model": model,
                 "account": acc.email,
+                "account_id": acc.id,
                 "latency_ms": elapsed,
                 **meta,
                 "truncated": str(meta.get("finish_reason") or "").upper() == "MAX_TOKENS",
@@ -1675,14 +2323,32 @@ async def _chat_once(prompt_or_contents: Any, model: str, system: str = "",
 # --------------------------------------------------------------------------- #
 
 
-def _ok(payload: Dict[str, Any]) -> str:
+def _sanitize_dsh_payload(value: Any, key: str = "") -> Any:
+    """Keep PTC-facing results compact and free of protocol-only metadata."""
+    if isinstance(value, dict):
+        return {k: _sanitize_dsh_payload(v, k) for k, v in value.items()
+                if k not in {"parts", "function_call", "continuation_log"}}
+    if isinstance(value, list):
+        return [_sanitize_dsh_payload(v, key) for v in value]
+    if isinstance(value, str) and key == "raw_text":
+        return value[:1200]
+    return value
+
+
+def _dumps(payload: Any) -> str:
+    if DSH_SAFE:
+        payload = _sanitize_dsh_payload(payload)
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     # Compact separators: every byte here is context the calling model pays for.
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def _ok(payload: Dict[str, Any]) -> str:
+    return _dumps(payload)
+
+
 def _err(message: str, **extra: Any) -> str:
-    return json.dumps({"status": "ERROR", "error": message, **extra},
-                      ensure_ascii=False, separators=(",", ":"))
+    return _dumps({"status": "ERROR", "error": message, **extra})
 
 
 def _repair_json(text: str) -> Optional[Any]:
@@ -1743,6 +2409,314 @@ def _safe_json(text: str) -> Optional[Any]:
                     # failures worth repairing; anything else is a real miss.
                     return _repair_json(candidate)
     return None
+
+_CODE_TASK_CHANGE_KEYS = {"path", "operation", "content", "search", "replace"}
+_CODE_TASK_ROOT_KEYS = {"analysis", "changes", "verification", "risks", "done"}
+_CODE_TASK_KNOWN_KEYS = _CODE_TASK_CHANGE_KEYS | _CODE_TASK_ROOT_KEYS
+_CODE_TASK_CODE_FIELDS = {"content", "search", "replace"}
+
+
+class _LenientCodeTaskParser:
+    """Recover a complete code-task object from dirty JSON.
+
+    This is deliberately a fallback: strict JSON always wins.  The parser keeps
+    raw newlines/tabs, repairs unescaped quotes in code fields, preserves unknown
+    backslash escapes, and discards any change whose string was cut at EOF.
+    """
+
+    def __init__(self, text: str):
+        t = text.strip()
+        if t.startswith("```"):
+            lines = t.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            t = "\n".join(lines).strip()
+        start = t.find("{")
+        self.text = t[start:] if start >= 0 else t
+        self.n = len(self.text)
+        self.pos = 1 if start >= 0 else 0
+        self.repaired = False
+        self.incomplete = False
+        self.saw_changes = False
+
+    def _skip_ws(self) -> None:
+        while self.pos < self.n and self.text[self.pos] in " \t\r\n":
+            self.pos += 1
+
+    def _parse_key(self) -> Optional[str]:
+        if self.pos >= self.n or self.text[self.pos] != '"':
+            return None
+        self.pos += 1
+        start = self.pos
+        escaped = False
+        while self.pos < self.n:
+            ch = self.text[self.pos]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                key = self.text[start:self.pos]
+                self.pos += 1
+                return key
+            self.pos += 1
+        self.incomplete = True
+        return None
+
+    def _looks_like_field_close(self, seen_keys: set[str]) -> bool:
+        j = self.pos + 1
+        while j < self.n and self.text[j] in " \t\r\n":
+            j += 1
+        if j >= self.n:
+            return True
+        if self.text[j] == "}":
+            k = j + 1
+            while k < self.n and self.text[k] in " \t\r\n":
+                k += 1
+            return k >= self.n or self.text[k] in ",]}"
+        if self.text[j] != ",":
+            return False
+        j += 1
+        while j < self.n and self.text[j] in " \t\r\n":
+            j += 1
+        if j >= self.n or self.text[j] != '"':
+            return False
+        key_start = j + 1
+        key_end = key_start
+        escaped = False
+        while key_end < self.n:
+            ch = self.text[key_end]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                break
+            key_end += 1
+        if key_end >= self.n:
+            return False
+        candidate = self.text[key_start:key_end]
+        if candidate not in _CODE_TASK_KNOWN_KEYS or candidate in seen_keys:
+            return False
+        k = key_end + 1
+        while k < self.n and self.text[k] in " \t\r\n":
+            k += 1
+        return k < self.n and self.text[k] == ":"
+
+    def _parse_string(self, mode: str = "normal",
+                      seen_keys: Optional[set[str]] = None) -> Tuple[str, bool]:
+        if self.pos >= self.n or self.text[self.pos] != '"':
+            return "", False
+        self.pos += 1
+        chars: List[str] = []
+        closed = False
+        simple = {'"': '"', "\\": "\\", "/": "/", "b": "\b",
+                  "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+        while self.pos < self.n:
+            ch = self.text[self.pos]
+            if ch == "\\":
+                if self.pos + 1 >= self.n:
+                    chars.append("\\")
+                    self.pos += 1
+                    break
+                nxt = self.text[self.pos + 1]
+                if mode == "path":
+                    # Windows paths often arrive with raw \n, \t, \U ... .  Only
+                    # quote and backslash are structurally meaningful here.
+                    if nxt in ('"', "\\"):
+                        chars.append(nxt)
+                        self.pos += 2
+                    else:
+                        chars.append("\\")
+                        self.pos += 1
+                    continue
+                if nxt in simple:
+                    chars.append(simple[nxt])
+                    self.pos += 2
+                    continue
+                if nxt == "u" and self.pos + 6 <= self.n:
+                    digits = self.text[self.pos + 2:self.pos + 6]
+                    if re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                        chars.append(chr(int(digits, 16)))
+                        self.pos += 6
+                        continue
+                # Python/JS regex escapes such as \d or \s are code, not JSON.
+                chars.append("\\")
+                self.pos += 1
+                continue
+            if ch == '"':
+                if mode != "code" or self._looks_like_field_close(seen_keys or set()):
+                    self.pos += 1
+                    closed = True
+                    break
+                chars.append('"')
+                self.repaired = True
+                self.pos += 1
+                continue
+            chars.append(ch)
+            self.pos += 1
+        if not closed:
+            self.incomplete = True
+        return "".join(chars), closed
+
+    def _parse_primitive(self) -> Any:
+        start = self.pos
+        while self.pos < self.n and self.text[self.pos] not in ",]}\r\n \t":
+            self.pos += 1
+        raw = self.text[start:self.pos].strip().lower()
+        if raw == "true":
+            return True
+        if raw == "false":
+            return False
+        return raw
+
+    def _parse_string_array(self) -> List[str]:
+        out: List[str] = []
+        if self.pos >= self.n or self.text[self.pos] != "[":
+            return out
+        self.pos += 1
+        closed = False
+        while self.pos < self.n:
+            self._skip_ws()
+            if self.pos >= self.n:
+                break
+            if self.text[self.pos] == "]":
+                self.pos += 1
+                closed = True
+                break
+            if self.text[self.pos] == '"':
+                value, ok = self._parse_string("normal")
+                if ok:
+                    out.append(value)
+                else:
+                    break
+            else:
+                self.pos += 1
+            self._skip_ws()
+            if self.pos < self.n and self.text[self.pos] == ",":
+                self.pos += 1
+        if not closed:
+            self.incomplete = True
+        return out
+
+    def _parse_change_object(self) -> Tuple[Optional[Dict[str, Any]], bool]:
+        self.pos += 1  # opening {
+        obj: Dict[str, Any] = {}
+        closed = False
+        while self.pos < self.n:
+            self._skip_ws()
+            if self.pos >= self.n:
+                break
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                closed = True
+                break
+            key = self._parse_key()
+            if not key:
+                self.pos += 1
+                continue
+            self._skip_ws()
+            if self.pos >= self.n or self.text[self.pos] != ":":
+                self.pos += 1
+                continue
+            self.pos += 1
+            self._skip_ws()
+            mode = "path" if key == "path" else ("code" if key in _CODE_TASK_CODE_FIELDS else "normal")
+            value, ok = self._parse_string(mode, set(obj))
+            if not ok:
+                return None, False
+            obj[key] = value
+            self._skip_ws()
+            if self.pos < self.n and self.text[self.pos] == ",":
+                self.pos += 1
+        return (obj if closed else None), closed
+
+    def _parse_changes(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if self.pos >= self.n or self.text[self.pos] != "[":
+            return out
+        self.pos += 1
+        closed = False
+        while self.pos < self.n:
+            self._skip_ws()
+            if self.pos >= self.n:
+                break
+            if self.text[self.pos] == "]":
+                self.pos += 1
+                closed = True
+                break
+            if self.text[self.pos] == "{":
+                item, ok = self._parse_change_object()
+                if ok and item:
+                    out.append(item)
+                else:
+                    self.incomplete = True
+                    break
+            else:
+                self.pos += 1
+            self._skip_ws()
+            if self.pos < self.n and self.text[self.pos] == ",":
+                self.pos += 1
+        if not closed:
+            self.incomplete = True
+        return out
+
+    def parse(self) -> Optional[Dict[str, Any]]:
+        result: Dict[str, Any] = {
+            "analysis": "", "changes": [], "verification": [], "risks": [],
+            "done": False,
+        }
+        root_closed = False
+        while self.pos < self.n:
+            self._skip_ws()
+            if self.pos >= self.n:
+                break
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                root_closed = True
+                break
+            key = self._parse_key()
+            if not key:
+                self.pos += 1
+                continue
+            self._skip_ws()
+            if self.pos >= self.n or self.text[self.pos] != ":":
+                self.pos += 1
+                continue
+            self.pos += 1
+            self._skip_ws()
+            if key == "changes":
+                self.saw_changes = True
+                result[key] = self._parse_changes()
+            elif key in ("verification", "risks"):
+                result[key] = self._parse_string_array()
+            elif key == "done":
+                result[key] = self._parse_primitive()
+            else:
+                value, _ = self._parse_string("normal")
+                result[key] = value
+            self._skip_ws()
+            if self.pos < self.n and self.text[self.pos] == ",":
+                self.pos += 1
+        if not root_closed:
+            self.incomplete = True
+        if not self.saw_changes:
+            return None
+        if self.incomplete:
+            result["done"] = False
+        if self.repaired or self.incomplete:
+            result["_salvage_note"] = (
+                "the model reply contained unescaped code characters or incomplete "
+                "structures; only complete change objects were kept"
+            )
+        return result
+
+
+def _parse_code_task_lenient(text: str) -> Optional[Dict[str, Any]]:
+    return _LenientCodeTaskParser(text).parse()
+
 
 def _salvage_changes(text: str) -> Dict[str, Any]:
     """Recover the complete edits from a reply that was cut short.
@@ -2014,7 +2988,10 @@ async def _chat_continue(prompt_or_contents: Any, model: str, system: str = "",
                          thinking_budget: Optional[int] = None,
                          tools: Optional[List[Dict[str, Any]]] = None,
                          max_continuations: int = MAX_CONTINUATIONS,
-                         total_budget_seconds: int = 900) -> Dict[str, Any]:
+                         total_budget_seconds: int = 900,
+                         preferred_account: Optional[str] = None,
+                         response_schema: Optional[Dict[str, Any]] = None,
+                         synthetic_code_tool: bool = False) -> Dict[str, Any]:
     """Keep writing when the model stops at its output cap.
 
     A reasoning model that hits max_tokens still returns a partial answer; asking
@@ -2026,7 +3003,10 @@ async def _chat_continue(prompt_or_contents: Any, model: str, system: str = "",
         last = await _chat_once(prompt_or_contents, model, system,
                                 temperature=temperature, max_tokens=max_tokens,
                                 json_mode=json_mode,
-                                thinking_budget=thinking_budget, tools=tools)
+                                thinking_budget=thinking_budget, tools=tools,
+                                preferred_account=preferred_account,
+                                response_schema=response_schema,
+                                synthetic_code_tool=synthetic_code_tool)
         if not isinstance(last, dict) or last.get("status") != "OK":
             return last
         if isinstance(prompt_or_contents, str):
@@ -2034,6 +3014,18 @@ async def _chat_continue(prompt_or_contents: Any, model: str, system: str = "",
         else:
             base = list(prompt_or_contents)
         text = last.get("text") or ""
+        if last.get("truncated") and (synthetic_code_tool or json_mode or last.get("function_call")):
+            # Structured output cannot be continued by naively appending another
+            # JSON object.  Return the partial safely; code_task can salvage
+            # complete edits or report TRUNCATED without fabricating syntax.
+            out = dict(last)
+            out.update({
+                "continuations": 0,
+                "truncated": True,
+                "structured_output_truncated": True,
+                "synthetic_tool_truncated": bool(synthetic_code_tool or last.get("function_call")),
+            })
+            return out
         rounds = 0
         log: List[str] = []
         while (rounds < max_continuations and last.get("truncated")
@@ -2044,8 +3036,9 @@ async def _chat_continue(prompt_or_contents: Any, model: str, system: str = "",
             if time.time() - started >= total_budget_seconds:
                 log.append("stop: budget")
                 break
+            model_parts = last.get("parts") if last.get("parts") else [{"text": text}]
             follow = base + [
-                {"role": "model", "parts": [{"text": text}]},
+                {"role": "model", "parts": model_parts},
                 {"role": "user", "parts": [{"text": (
                     "Continue exactly where you stopped. Do not repeat text "
                     "already written. Output only the continuation.")}]},
@@ -2055,7 +3048,10 @@ async def _chat_continue(prompt_or_contents: Any, model: str, system: str = "",
                                        temperature=temperature,
                                        max_tokens=max_tokens,
                                        json_mode=json_mode,
-                                       thinking_budget=thinking_budget, tools=tools)
+                                       thinking_budget=thinking_budget, tools=tools,
+                                       preferred_account=last.get("account") or preferred_account,
+                                       response_schema=response_schema,
+                                       synthetic_code_tool=synthetic_code_tool)
             except Exception:
                 # Keep what was already written: a broken follow-up must not
                 # throw away a usable partial answer.
@@ -2100,13 +3096,55 @@ app = MCPServer(
         "describing what failed. Verify anything the pool returns before acting on "
         "it.\n\n"
         "Model aliases: pro, flash, fast, deep, high and gemini are the strongest "
-        "tier; lite and cheap the fastest; exact model ids also work."
+        "tier; lite and cheap the fastest; exact model ids also work.\n\n"
+        "PTC clients: never embed raw newlines or quotes in generated string "
+        "literals. Use JSON.stringify for tool arguments and parse tool results "
+        "with JSON.parse only after receiving the complete text."
     ),
 )
 
 
 # Probe results are cached because every health check costs real model requests.
 _HEALTH_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+@contextlib.asynccontextmanager
+async def _progress_heartbeat(ctx: Optional[Context], label: str,
+                              interval: float = 5.0):
+    """Emit spec-compliant progress while a long tool waits on the model.
+
+    ``Context.report_progress`` is a no-op when the caller did not supply a
+    progress token, so direct Python callers and non-progress MCP clients are
+    safe.  The task is always cancelled in ``finally``.
+    """
+    if ctx is None:
+        yield
+        return
+    stop = asyncio.Event()
+
+    async def beat() -> None:
+        tick = 0
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                tick += 1
+                try:
+                    await ctx.report_progress(float(tick), message=label)
+                except Exception:
+                    # Progress must never break the actual operation.
+                    pass
+
+    task = asyncio.create_task(beat())
+    try:
+        yield
+    finally:
+        stop.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def _declared_models(accounts: List[Account]) -> Dict[str, Dict[str, Any]]:
@@ -2298,6 +3336,7 @@ def status() -> str:
 
     known = [r["gemini_5h_remaining"] for r in rows
              if isinstance(r["gemini_5h_remaining"], (int, float))]
+    endpoint_state = _ENDPOINT_MANAGER.snapshot()
     return _ok({
         "status": "OK",
         "accounts_total": len(accounts),
@@ -2307,6 +3346,9 @@ def status() -> str:
         "server_version": SERVER_VERSION,
         "code": _code_stamp(),
         "stats": POOL._stats,
+        "active_endpoint": endpoint_state["active_endpoint"],
+        "circuit_breaker": endpoint_state,
+        "cached_tokens_total": POOL._stats.get("cached_tokens_total", 0),
         "oauth_refresh_configured": bool(CLIENT_ID and CLIENT_SECRET),
         "state_dir": str(STATE_DIR),
         "note": ("ready counts accounts whose token can be refreshed on demand; an "
@@ -2351,6 +3393,7 @@ async def chat(
         ge=0, le=65536,
         description=("Hidden reasoning cap. web=true defaults it to 512, because a "
                      "grounded call can otherwise burn the whole budget thinking."))] = None,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Ask one question and get plain text back. Stateless, no conversation created.
 
@@ -2371,11 +3414,12 @@ async def chat(
 
     if web and thinking_budget is None:
         thinking_budget = 512
-    result = await _chat_continue(
-        contents, model, system, temperature, max_tokens,
-        thinking_budget=thinking_budget,
-        tools=[{"google_search": {}}] if web else None,
-    )
+    async with _progress_heartbeat(ctx, "Đang chờ Gemini trả lời"):
+        result = await _chat_continue(
+            contents, model, system, temperature, max_tokens,
+            thinking_budget=thinking_budget,
+            tools=[{"google_search": {}}] if web else None,
+        )
     return _ok(result)
 
 
@@ -2450,6 +3494,7 @@ async def agent(
         description="Also expose write_file.")] = False,
     allow_shell: Annotated[bool, Field(
         description="Also expose run_shell (powerful and risky).")] = False,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Let the model run its own tool loop (web search, page fetch, file reads), then answer.
 
@@ -2459,8 +3504,9 @@ async def agent(
     """
     if not task or not task.strip():
         return _err("task must not be empty.")
-    result = await _agent_run(task, model, system, max_steps, max_tokens,
-                              allow_write, allow_shell)
+    async with _progress_heartbeat(ctx, "Agent đang nghiên cứu"):
+        result = await _agent_run(task, model, system, max_steps, max_tokens,
+                                  allow_write, allow_shell)
     return _ok(result)
 
 
@@ -2544,6 +3590,7 @@ def _sessions_load() -> None:
             sess.setdefault("model", DEFAULT_MODEL)
             sess.setdefault("turns", 0)
             sess.setdefault("chars_dropped", 0)
+            sess.setdefault("pinned_account", None)
             sess.setdefault("created", now)
             _SESSIONS[sid] = sess
     except Exception:
@@ -2608,7 +3655,7 @@ async def session_new(
     session = {
         "contents": [], "system": system, "model": _resolve_model(model),
         "created": time.time(), "last_used": time.time(), "turns": 0,
-        "chars_dropped": 0,
+        "chars_dropped": 0, "pinned_account": None,
     }
     _SESSIONS[session_id] = session
     out: Dict[str, Any] = {"status": "OK", "session_id": session_id,
@@ -2626,8 +3673,9 @@ async def session_new(
             await asyncio.to_thread(_sessions_save, True)
             return _ok({"status": result.get("status"),
                         "error": result.get("error"), "session_id": session_id})
-        session["contents"].append({"role": "model",
-                                    "parts": [{"text": result["text"]}]})
+        session["pinned_account"] = result.get("account")
+        model_parts = result.get("parts") if result.get("parts") else [{"text": result["text"]}]
+        session["contents"].append({"role": "model", "parts": model_parts})
         session["turns"] += 1
         session["last_used"] = time.time()
         _session_trim(session)
@@ -2671,14 +3719,17 @@ async def session_send(
         sess["contents"].append({"role": "user", "parts": [{"text": message}]})
         result = await _chat_once(list(sess["contents"]), sess["model"],
                                   sess["system"], temperature=temperature,
-                                  max_tokens=max_tokens)
+                                  max_tokens=max_tokens,
+                                  preferred_account=sess.get("pinned_account"))
         if result.get("status") != "OK":
             sess["contents"].pop()
             return _ok({"status": result.get("status"),
                         "error": result.get("error"), "session_id": session_id})
 
-        sess["contents"].append({"role": "model",
-                                 "parts": [{"text": result["text"]}]})
+        if result.get("account"):
+            sess["pinned_account"] = result.get("account")
+        model_parts = result.get("parts") if result.get("parts") else [{"text": result["text"]}]
+        sess["contents"].append({"role": "model", "parts": model_parts})
         sess["turns"] += 1
         sess["last_used"] = time.time()
         _session_trim(sess)
@@ -2790,6 +3841,10 @@ async def code_task(
                    "continues automatically when it runs out.")] = 32768,
     images: Annotated[List[str], Field(
         description="Screenshots or mockups to look at while editing.")] = [],
+    synthetic_tool: Annotated[bool, Field(
+        description="Whether to force structured code edits via synthetic tool calling "
+                    "(apply_code_edits) to prevent JSON syntax errors and escaping overhead.")] = False,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Turn a work order into structured file edits for you to apply and verify.
 
@@ -2894,17 +3949,39 @@ async def code_task(
     payload_contents: Any = (prompt_text if not images
                              else [{"role": "user", "parts": prompt_parts}])
 
-    result = await _chat_continue(payload_contents, model, system,
-                                  temperature=0.2, max_tokens=max_tokens,
-                                  json_mode=True, max_continuations=2)
+    use_synthetic = bool(synthetic_tool or os.environ.get("AGY_POOL_SYNTHETIC_TOOL", "0").lower() in ("1", "true"))
+    async with _progress_heartbeat(ctx, "Đang tạo code changes"):
+        result = await _chat_continue(payload_contents, model, system,
+                                      temperature=0.2, max_tokens=max_tokens,
+                                      json_mode=True, max_continuations=2,
+                                      synthetic_code_tool=use_synthetic)
     if result.get("status") != "OK":
         return _ok(result)
 
     finish_reason = result.get("finish_reason")
     reply = result.get("text") or ""
     parsed = _safe_json(reply)
+    if parsed is None and result.get("function_call"):
+        fc_args = result["function_call"].get("args")
+        if isinstance(fc_args, dict):
+            parsed = fc_args
+    if parsed is None and result.get("parts"):
+        for p in result["parts"]:
+            if isinstance(p, dict) and "functionCall" in p:
+                fc_args = p["functionCall"].get("args")
+                if isinstance(fc_args, dict):
+                    parsed = fc_args
+                    break
+    if parsed is None:
+        lenient = _parse_code_task_lenient(reply)
+        if lenient and (lenient.get("changes") or not lenient.get("_salvage_note")):
+            parsed = lenient
     cut_short = (bool(result.get("truncated"))
                  or str(finish_reason or "").upper() == "MAX_TOKENS")
+    if isinstance(parsed, dict) and parsed.get("_salvage_note") and cut_short:
+        parsed["_salvage_note"] += (
+            f"; the reply reached max_tokens={max_tokens}, so only complete edits were kept"
+        )
     def _recover(text: str, why: str) -> Optional[Dict[str, Any]]:
         """Keep the complete edits of a reply that was not a clean JSON object."""
         kept = _salvage_changes(text)
@@ -2929,9 +4006,11 @@ async def code_task(
         strict_system = system + (
             "\nREMINDER: the previous reply was rejected because it was not a JSON object. "
             "Reply with exactly one JSON object: first character {, last }.")
-        strict = await _chat_continue(payload_contents, model, strict_system,
-                                      temperature=0.1, max_tokens=max_tokens,
-                                      json_mode=True, max_continuations=1)
+        async with _progress_heartbeat(ctx, "Đang thử parse lại JSON"):
+            strict = await _chat_continue(payload_contents, model, strict_system,
+                                          temperature=0.1, max_tokens=max_tokens,
+                                          json_mode=True, max_continuations=1,
+                                          synthetic_code_tool=use_synthetic)
         if strict.get("status") == "OK":
             result = {**strict, "retried": True}
             finish_reason = strict.get("finish_reason")
@@ -2939,6 +4018,10 @@ async def code_task(
             cut_short = (bool(strict.get("truncated"))
                          or str(finish_reason or "").upper() == "MAX_TOKENS")
             parsed = _safe_json(reply)
+            if parsed is None and strict.get("function_call"):
+                fc_args = strict["function_call"].get("args")
+                if isinstance(fc_args, dict):
+                    parsed = fc_args
             if not isinstance(parsed, dict):
                 parsed = _recover(reply, (
                     "recovered from the retry reply, which was still not clean JSON"))
@@ -3037,6 +4120,7 @@ async def batch(
         ge=1, le=65536, description="Output budget per prompt.")] = 8192,
     max_parallel: Annotated[int, Field(
         ge=1, le=8, description="How many run at once.")] = 4,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Run several independent prompts in parallel, spread across accounts.
 
@@ -3071,7 +4155,8 @@ async def batch(
             result["index"] = index
             return result
 
-    results = await asyncio.gather(*(one(i, p) for i, p in enumerate(prompts)))
+    async with _progress_heartbeat(ctx, "Đang chạy batch song song"):
+        results = await asyncio.gather(*(one(i, p) for i, p in enumerate(prompts)))
     _cap_results(results)
     ok = sum(1 for r in results if r.get("status") == "OK")
     return _ok({
@@ -3093,6 +4178,7 @@ async def fanout(
                      "factual replies, return the majority answer and the distribution."))] = "all",
     max_parallel: Annotated[int, Field(
         ge=1, le=8, description="Concurrency cap.")] = 6,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Fan a work order out to several agents in parallel, then collect every result.
 
@@ -3145,7 +4231,8 @@ async def fanout(
             return result
 
     started = time.time()
-    results = await asyncio.gather(*(one(i, item) for i, item in enumerate(plan)))
+    async with _progress_heartbeat(ctx, "Đang fan-out nhiều agent"):
+        results = await asyncio.gather(*(one(i, item) for i, item in enumerate(plan)))
     wall_ms = int((time.time() - started) * 1000)
     _cap_results(results)
 
@@ -3206,6 +4293,7 @@ async def review(
         ge=1, le=65536, description="Maximum output tokens.")] = 8192,
     images: Annotated[List[str], Field(
         description="Screenshots of the result.")] = [],
+    ctx: Optional[Context] = None,
 ) -> str:
     """Get an independent pass/fail verdict on finished work.
 
@@ -3279,9 +4367,10 @@ async def review(
     payload_contents: Any = (prompt_text if not images
                              else [{"role": "user", "parts": prompt_parts}])
 
-    result = await _chat_once(payload_contents, model, system,
-                              temperature=0.1, max_tokens=max_tokens,
-                              json_mode=True)
+    async with _progress_heartbeat(ctx, "Đang review kết quả"):
+        result = await _chat_once(payload_contents, model, system,
+                                  temperature=0.1, max_tokens=max_tokens,
+                                  json_mode=True)
     if result.get("status") != "OK":
         return _ok(result)
 
@@ -3312,6 +4401,7 @@ async def map_reduce(
         ge=1, le=6, description="How many items run at once.")] = 3,
     chunk_chars: Annotated[int, Field(
         ge=1000, le=400000, description="Chunk size in characters.")] = 60000,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Chunk long input, one call per chunk, then one reduce call.
 
@@ -3329,8 +4419,9 @@ async def map_reduce(
     if total > 4_000_000:
         return _err(f"input is {total} chars (~{total // 4} tokens). "
                     "Split it into several map_reduce calls.")
-    result = await _map_reduce(items, instruction, model, reduce_instruction,
-                               max_parallel=max_parallel, chunk_chars=chunk_chars)
+    async with _progress_heartbeat(ctx, "Đang xử lý map-reduce"):
+        result = await _map_reduce(items, instruction, model, reduce_instruction,
+                                   max_parallel=max_parallel, chunk_chars=chunk_chars)
     result["chars_in"] = total
     result["chars_out"] = len(result.get("text") or "")
     return _ok(result)

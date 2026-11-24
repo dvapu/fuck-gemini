@@ -181,7 +181,7 @@ one, and a fallback when one agent fails.
 | `agy_pool_batch` | Independent prompts in parallel across accounts. |
 | `agy_pool_status` | Accounts, token expiry, cooldowns, counters. |
 | `agy_pool_health` | Live probe: which models really respond. |
-| `agy_pool_quota` | Remaining quota per account (cached). |
+| `map_reduce` | Split large input into chunks, process, and combine. |
 | `agy_pool_models` | Model names + aliases. |
 
 ### Models
@@ -344,3 +344,6 @@ và `gemini-2.5-pro` (503). Pool tự phát hiện và trả `MODEL_UNAVAILABLE`
 ## License
 
 MIT
+
+## Known failure modes and their fixes
+See agy_pool.py docstrings and tests/ for details: truncation (continues + salvages), argument shapes (tolerant), non-JSON replies (one cold retry), and status.code.restart_needed for stale processes.

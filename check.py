@@ -31,7 +31,7 @@ async def main() -> int:
     print(f"[{'OK' if mod.CLIENT_ID and mod.CLIENT_SECRET else 'WARN'}] "
           f"oauth refresh credentials: {'found' if mod.CLIENT_ID and mod.CLIENT_SECRET else 'missing (auto-refresh disabled)'}")
 
-    status = json.loads(mod.agy_pool_status())
+    status = json.loads(mod.status())
     ready = status["accounts_ready"]
     print(f"[{'OK' if ready else 'FAIL'}]  accounts ready: {ready}/{status['accounts_total']}")
     if not ready:
@@ -39,7 +39,7 @@ async def main() -> int:
         return 1
 
     print("\n[ping] calling model 'flash' ...")
-    result = json.loads(await mod.agy_pool_chat("Reply with exactly: POOL_OK", model="flash"))
+    result = json.loads(await mod.chat("Reply with exactly: POOL_OK", model="flash"))
     if result.get("status") == "OK":
         print(f"[OK]   response: {result.get('text')!r}")
         print(f"       account: {result.get('account')}  latency: {result.get('latency_ms')} ms")

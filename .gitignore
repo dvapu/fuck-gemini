@@ -9,3 +9,12 @@ accounts/
 __pycache__/
 *.pyc
 .venv/
+
+# Local working artifacts (never commit)
+*.bak
+HANDOFF.md
+tasks_*.json
+FIXES_*.md
+JSON_REPAIR_*.md
+GEMINI_V3_AUDIT.md
+poolbatch.py
