@@ -1722,6 +1722,65 @@ def _safe_json(text: str) -> Optional[Any]:
                     return _repair_json(candidate)
     return None
 
+def _salvage_changes(text: str) -> Dict[str, Any]:
+    """Recover the complete edits from a reply that was cut short.
+
+    A truncated answer is expensive: the work order was paid for and part of the
+    edit set is already written. Instead of discarding it, keep every change
+    object that is complete and say so in the result.
+    """
+    salvaged: Dict[str, Any] = {"changes": [], "verification": [], "risks": [],
+                                "done": False}
+    if "{" not in text:
+        return salvaged
+    match = re.search(r'"analysis"\s*:\s*("(?:[^"\\]|\\.)*")', text)
+    if match:
+        try:
+            salvaged["analysis"] = json.loads(match.group(1))
+        except Exception:
+            pass
+    key = text.find('"changes"')
+    if key < 0:
+        return salvaged
+    opening = text.find("[", key)
+    if opening < 0:
+        return salvaged
+    depth = 0
+    in_str = False
+    escaped = False
+    obj_start = -1
+    for pos in range(opening, len(text)):
+        ch = text[pos]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                obj_start = pos
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+            if depth == 0 and obj_start >= 0:
+                blob = text[obj_start:pos + 1]
+                try:
+                    item = json.loads(blob)
+                except Exception:
+                    item = _repair_json(blob)
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    salvaged["changes"].append(item)
+                obj_start = -1
+        elif ch == "]" and depth == 0:
+            break
+    return salvaged
+
 
 # --------------------------------------------------------------------------- #
 # Long-input handling
@@ -2689,7 +2748,7 @@ async def code_task(
         description="What must be achieved, with acceptance criteria.")],
     files: Annotated[List[Dict[str, str]], Field(
         description='Files to work on, as [{"path": "...", "content": "..."}]. '
-                    'For files already on disk prefer `paths` instead.')],
+                    'For files already on disk prefer `paths` instead.')] = [],
     paths: Annotated[List[str], Field(
         description="Local file paths the server reads itself. Cheaper than "
                     "sending content through the tool-call JSON.")] = [],
@@ -2700,7 +2759,8 @@ async def code_task(
     model: Annotated[str, Field(
         description="Alias or model id.")] = "pro",
     max_tokens: Annotated[int, Field(
-        ge=1, le=65536, description="Maximum output tokens for the whole edit set.")] = 16384,
+        ge=1, le=65536, description="Output budget for the whole edit set; the reply "
+                   "continues automatically when it runs out.")] = 32768,
     images: Annotated[List[str], Field(
         description="Screenshots or mockups to look at while editing.")] = [],
 ) -> str:
@@ -2753,7 +2813,13 @@ async def code_task(
         "- For patch operations, 'search' must match the existing file exactly.\n"
         "- If the goal cannot be completed with the given information, set "
         "done=false and explain what is missing in risks.\n"
-        "- Do not invent file paths that were not given unless clearly required."
+        "- Do not invent file paths that were not given unless clearly required.\n"
+        "- Keep the reply compact: one sentence of analysis, no repetition of the "
+        "input files, no markdown outside the JSON.\n"
+        "- Prefer a 'patch' with a short exact 'search' over 'replace' for long "
+        "files; rewriting a very long file is what gets cut off.\n"
+        "- If the work does not fit the output budget, return the most important "
+        "edit alone and list the rest under risks instead of a partial file."
     )
 
     parts: List[str] = [f"# Goal\n{goal}"]
@@ -2783,27 +2849,43 @@ async def code_task(
     payload_contents: Any = (prompt_text if not images
                              else [{"role": "user", "parts": prompt_parts}])
 
-    result = await _chat_once(payload_contents, model, system,
-                              temperature=0.2, max_tokens=max_tokens,
-                              json_mode=True)
+    result = await _chat_continue(payload_contents, model, system,
+                                  temperature=0.2, max_tokens=max_tokens,
+                                  json_mode=True, max_continuations=2)
     if result.get("status") != "OK":
         return _ok(result)
 
     finish_reason = result.get("finish_reason")
-    parsed = _safe_json(result["text"])
+    reply = result.get("text") or ""
+    parsed = _safe_json(reply)
+    cut_short = (bool(result.get("truncated"))
+                 or str(finish_reason or "").upper() == "MAX_TOKENS")
+    if parsed is None and cut_short:
+        # Continuing did not finish the JSON: keep every edit that is complete
+        # instead of losing a paid-for work order.
+        salvaged = _salvage_changes(reply)
+        if salvaged["changes"]:
+            salvaged["_salvage_note"] = (
+                f"the reply ran out at max_tokens={max_tokens} and was continued "
+                f"{result.get('continuations', 0)} time(s); only the complete edits "
+                "are returned. Send the remaining work as a smaller order.")
+            parsed = salvaged
     if parsed is None:
-        if isinstance(finish_reason, str) and finish_reason.upper() == "MAX_TOKENS":
+        raw_tail = reply[-2000:]
+        if cut_short:
             return _ok({
                 "status": "TRUNCATED",
-                "error": f"Output was cut at max_tokens={max_tokens} before the JSON finished.",
+                "error": (f"Output was cut at max_tokens={max_tokens} before any "
+                          "complete JSON object was produced."),
                 "hint": "Split the work order into smaller tasks or raise max_tokens.",
                 "finish_reason": finish_reason,
                 "account": result.get("account"),
+                "raw_text": raw_tail,
             })
         return _ok({
             "status": "UNPARSABLE",
             "error": "Model did not return valid JSON.",
-            "raw_text": result["text"][:4000],
+            "raw_text": raw_tail,
             "finish_reason": finish_reason,
             "account": result.get("account"),
         })
@@ -2849,7 +2931,11 @@ async def code_task(
         parsed["changes"] = valid
         parsed["invalid_changes"] = invalid
 
-    parsed["status"] = "OK"
+    salvage_note = parsed.pop("_salvage_note", None)
+    parsed["status"] = "PARTIAL" if salvage_note else "OK"
+    if salvage_note:
+        parsed["note"] = salvage_note
+        parsed["continued"] = result.get("continuations", 0)
     parsed["model"] = result.get("model")
     parsed["account"] = result.get("account")
     parsed["latency_ms"] = result.get("latency_ms")
@@ -2968,7 +3054,7 @@ async def fanout(
                                       bool(item.get("allow_shell")))
                 else:
                     coro = _chat_once(prompt, requested, temperature=0.2,
-                                      max_tokens=int(item.get("max_tokens") or 16384))
+                                      max_tokens=int(item.get("max_tokens") or 32768))
                 result = await asyncio.wait_for(coro, timeout=remaining)
             except asyncio.TimeoutError:
                 result = {"status": "TIMEOUT", "error": "fan-out deadline reached"}
