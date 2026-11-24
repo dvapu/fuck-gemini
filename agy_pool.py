@@ -52,6 +52,7 @@ import asyncio
 import base64
 import contextlib
 import email.utils
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -200,7 +201,28 @@ KNOWN_DEAD = {
     "gemini-3.5-flash-extra-low",  # same
 }
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
+# Module load time. A patched file only runs after the client restarts the server, so
+# every status reply says whether the file on disk is newer than this process.
+_STARTED_AT = time.time()
+_CODE_PATH = Path(__file__).resolve()
+
+
+def _code_stamp() -> Dict[str, Any]:
+    """Fingerprint of the code this process actually loaded."""
+    try:
+        data = _CODE_PATH.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()[:12]
+        mtime = int(_CODE_PATH.stat().st_mtime)
+    except Exception:
+        return {"file": _CODE_PATH.name, "sha256_12": "unknown", "restart_needed": False}
+    return {
+        "file": _CODE_PATH.name,
+        "sha256_12": digest,
+        "file_mtime": mtime,
+        "process_started": int(_STARTED_AT),
+        "restart_needed": mtime > _STARTED_AT,
+    }
 
 # Tool names are prefixed so several clients can share one server process, but a
 # client that already namespaces by server name (DSH renders
@@ -2282,6 +2304,8 @@ def status() -> str:
         "accounts_ready": sum(1 for r in rows if r["ready"]),
         "average_gemini_5h": (sum(known) / len(known)) if known else None,
         "default_model": DEFAULT_MODEL,
+        "server_version": SERVER_VERSION,
+        "code": _code_stamp(),
         "stats": POOL._stats,
         "oauth_refresh_configured": bool(CLIENT_ID and CLIENT_SECRET),
         "state_dir": str(STATE_DIR),
@@ -2745,10 +2769,13 @@ def _cap_results(results: List[Dict[str, Any]],
 @app.tool(name=_t("code_task"))
 async def code_task(
     goal: Annotated[str, Field(
-        description="What must be achieved, with acceptance criteria.")],
-    files: Annotated[List[Dict[str, str]], Field(
-        description='Files to work on, as [{"path": "...", "content": "..."}]. '
-                    'For files already on disk prefer `paths` instead.')] = [],
+        description="What must be achieved, with acceptance criteria.")] = "",
+    work_order: Annotated[str, Field(
+        description="Alias for goal, for callers that name the argument differently.")] = "",
+    files: Annotated[Any, Field(
+        description='Files to work on, as [{"path": "...", "content": "..."}]. A bare '
+                    'path string or a {"path": ...} object without content is read from '
+                    'disk instead. For files already on disk prefer `paths`.')] = [],
     paths: Annotated[List[str], Field(
         description="Local file paths the server reads itself. Cheaper than "
                     "sending content through the tool-call JSON.")] = [],
@@ -2770,8 +2797,25 @@ async def code_task(
     changes[] (create/replace/patch), verification[] and risks[]. Apply the
     changes yourself, then verify for real: its `done` flag is an opinion.
     """
-    if not goal or not goal.strip():
-        return _err("goal must not be empty.")
+    goal = (goal or "").strip() or (work_order or "").strip()
+    if not goal:
+        return _err("goal must not be empty (pass goal, or work_order as an alias).")
+    # A bare path, or a {path} object with no content, means "read that file": every
+    # wrong shape of this used to cost a whole round trip.
+    if isinstance(files, list):
+        kept: List[Any] = []
+        extra_paths: List[str] = []
+        for item in files:
+            if isinstance(item, str) and item.strip():
+                extra_paths.append(item.strip())
+            elif (isinstance(item, dict) and isinstance(item.get("path"), str)
+                  and not isinstance(item.get("content"), str)):
+                extra_paths.append(str(item["path"]).strip())
+            else:
+                kept.append(item)
+        files = kept
+        if extra_paths:
+            paths = list(paths or []) + extra_paths
     cleaned_files, files_err = _validate_files(files)
     if files_err:
         return _err(files_err)
@@ -2794,6 +2838,7 @@ async def code_task(
     system = (
         "You are a precise senior software engineer working under an orchestrator.\n"
         "You never claim work is done. You only propose concrete edits.\n"
+        "Your first character is { and your last is }: one JSON object, nothing else.\n"
         "Respond with a single JSON object and nothing else, matching this schema:\n"
         "{\n"
         '  "analysis": "short reasoning about what must change",\n'
@@ -2860,16 +2905,43 @@ async def code_task(
     parsed = _safe_json(reply)
     cut_short = (bool(result.get("truncated"))
                  or str(finish_reason or "").upper() == "MAX_TOKENS")
-    if parsed is None and cut_short:
-        # Continuing did not finish the JSON: keep every edit that is complete
-        # instead of losing a paid-for work order.
-        salvaged = _salvage_changes(reply)
-        if salvaged["changes"]:
-            salvaged["_salvage_note"] = (
+    def _recover(text: str, why: str) -> Optional[Dict[str, Any]]:
+        """Keep the complete edits of a reply that was not a clean JSON object."""
+        kept = _salvage_changes(text)
+        if not kept["changes"]:
+            return None
+        kept["_salvage_note"] = why
+        return kept
+
+    if parsed is None:
+        if cut_short:
+            parsed = _recover(reply, (
                 f"the reply ran out at max_tokens={max_tokens} and was continued "
                 f"{result.get('continuations', 0)} time(s); only the complete edits "
-                "are returned. Send the remaining work as a smaller order.")
-            parsed = salvaged
+                "are returned. Send the remaining work as a smaller order."))
+        if parsed is None:
+            parsed = _recover(reply, (
+                "the model answered outside the JSON contract; the complete edits in its "
+                "reply were salvaged. Ask for a smaller edit next time."))
+    if parsed is None and not cut_short:
+        # Prose, a markdown fence or a rambling analysis used to cost a whole paid work
+        # order: ask once more, colder, for the object alone.
+        strict_system = system + (
+            "\nREMINDER: the previous reply was rejected because it was not a JSON object. "
+            "Reply with exactly one JSON object: first character {, last }.")
+        strict = await _chat_continue(payload_contents, model, strict_system,
+                                      temperature=0.1, max_tokens=max_tokens,
+                                      json_mode=True, max_continuations=1)
+        if strict.get("status") == "OK":
+            result = {**strict, "retried": True}
+            finish_reason = strict.get("finish_reason")
+            reply = strict.get("text") or ""
+            cut_short = (bool(strict.get("truncated"))
+                         or str(finish_reason or "").upper() == "MAX_TOKENS")
+            parsed = _safe_json(reply)
+            if not isinstance(parsed, dict):
+                parsed = _recover(reply, (
+                    "recovered from the retry reply, which was still not clean JSON"))
     if parsed is None:
         raw_tail = reply[-2000:]
         if cut_short:
@@ -2890,10 +2962,18 @@ async def code_task(
             "account": result.get("account"),
         })
 
+    if isinstance(parsed, list):
+        # A bare array of changes is a very common shape; wrap it instead of failing.
+        items = [x for x in parsed if isinstance(x, dict) and isinstance(x.get("path"), str)]
+        if items:
+            parsed = {"analysis": "", "changes": items, "verification": [], "risks": [],
+                      "done": False,
+                      "_salvage_note": ("the model replied with a bare array of changes; "
+                                        "it was wrapped into the response object")}
     if not isinstance(parsed, dict):
         return _ok({"status": "UNPARSABLE",
-                    "error": "Model returned JSON that is not an object.",
-                    "raw_text": result["text"][:4000]})
+                    "error": "Model returned JSON that is not an object or a list of changes.",
+                    "raw_text": reply[:4000]})
 
     raw = parsed.get("changes")
     if not isinstance(raw, list):
@@ -3111,10 +3191,13 @@ async def fanout(
 @app.tool(name=_t("review"))
 async def review(
     goal: Annotated[str, Field(
-        description="The original goal and its acceptance criteria.")],
-    files: Annotated[List[Dict[str, str]], Field(
+        description="The original goal and its acceptance criteria.")] = "",
+    work_order: Annotated[str, Field(
+        description="Alias for goal, for callers that name the argument differently.")] = "",
+    files: Annotated[Any, Field(
         description='Current state of the files to review, as [{"path", "content"}]. '
-                    'Prefer `paths` for files already on disk.')],
+                    'A bare path or a {"path"} object is read from disk. '
+                    'Prefer `paths` for files already on disk.')] = [],
     paths: Annotated[List[str], Field(
         description="Local file paths the server reads itself.")] = [],
     model: Annotated[str, Field(
@@ -3130,8 +3213,25 @@ async def review(
     decide whether to stop or send another work order. Use a different model than
     the one that produced the work when possible.
     """
-    if not goal or not goal.strip():
-        return _err("goal must not be empty.")
+    goal = (goal or "").strip() or (work_order or "").strip()
+    if not goal:
+        return _err("goal must not be empty (pass goal, or work_order as an alias).")
+    # A bare path, or a {path} object with no content, means "read that file": every
+    # wrong shape of this used to cost a whole round trip.
+    if isinstance(files, list):
+        kept: List[Any] = []
+        extra_paths: List[str] = []
+        for item in files:
+            if isinstance(item, str) and item.strip():
+                extra_paths.append(item.strip())
+            elif (isinstance(item, dict) and isinstance(item.get("path"), str)
+                  and not isinstance(item.get("content"), str)):
+                extra_paths.append(str(item["path"]).strip())
+            else:
+                kept.append(item)
+        files = kept
+        if extra_paths:
+            paths = list(paths or []) + extra_paths
     cleaned_files, files_err = _validate_files(files)
     if files_err:
         return _err(files_err)
